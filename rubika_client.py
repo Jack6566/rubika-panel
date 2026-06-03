@@ -261,6 +261,27 @@ def _type_of(obj):
     return (t or "").lower()
 
 
+def _status_rank(u):
+    """Rank a user by presence for ordering:
+        0 = Online, 1 = recently/last seen, 2 = unknown/other.
+    Tolerant about which field/version exposes the status.
+    """
+    raw = None
+    for attr in ("last_online", "status", "online_time", "last_seen", "presence"):
+        v = getattr(u, attr, None)
+        if v is None and isinstance(u, dict):
+            v = u.get(attr)
+        if v not in (None, ""):
+            raw = v
+            break
+    s = str(raw).lower()
+    if "online" in s:
+        return 0
+    if "recent" in s or "last" in s:
+        return 1
+    return 2
+
+
 # --------------------------------------------------------------------------- #
 # Recipients: contacts + groups (paginated; Rubika returns ~100 per page)
 # --------------------------------------------------------------------------- #
@@ -268,8 +289,8 @@ def _next_start_id(result):
     return _get(result, "next_start_id") or _get(result, "next_start_index")
 
 
-async def get_contacts(client: Client) -> list:
-    """Return a list of (guid, name) for ALL contact users (paginated)."""
+async def get_contacts_full(client: Client) -> list:
+    """Return ALL contacts as (guid, name, status_rank), paginated."""
     out = []
     seen = set()
     start_id = None
@@ -282,11 +303,16 @@ async def get_contacts(client: Client) -> list:
             guid = _guid_of(u)
             if guid and guid not in seen:
                 seen.add(guid)
-                out.append((guid, _name_of(u)))
+                out.append((guid, _name_of(u), _status_rank(u)))
         start_id = _next_start_id(result)
         if not start_id or not users:
             break
     return out
+
+
+async def get_contacts(client: Client) -> list:
+    """Return a list of (guid, name) for ALL contact users (paginated)."""
+    return [(g, n) for (g, n, _r) in await get_contacts_full(client)]
 
 
 async def get_chats_split(client: Client):
@@ -346,29 +372,30 @@ async def get_ordered_recipients(client: Client):
     Order:
       1) contacts we ALREADY have a private chat with, MOST RECENTLY ACTIVE
          FIRST (Rubika returns chats newest-first)
-      2) the remaining contacts
+      2) the remaining contacts, ordered by presence: Online, then last-seen
+         recently, then the rest
       3) groups
-    Returns (ordered_guids, stats) where stats = {contacts, groups, with_chat,
-    no_target} and no_target counts contacts with no usable guid (logged).
+    Returns (ordered_guids, stats).
     """
-    contacts = await get_contacts(client)
+    contacts = await get_contacts_full(client)  # (guid, name, status_rank)
     groups, user_chats = await get_chats_split(client)
 
-    contact_guids = set()
+    rank_by_guid = {}
     no_target = 0
-    for guid, _name in contacts:
+    for guid, _name, rank in contacts:
         if not guid:
             no_target += 1
             continue
-        contact_guids.add(guid)
+        rank_by_guid[guid] = rank
 
     # 1) contacts that have a chat, in recent-activity order
-    with_chat = [g for g in user_chats if g in contact_guids]
+    with_chat = [g for g in user_chats if g in rank_by_guid]
     with_chat_set = set(with_chat)
-    # 2) the rest of the contacts (no existing chat)
-    without_chat = [g for g in contact_guids if g not in with_chat_set]
+    # 2) the rest of the contacts, ordered by presence rank (Online first)
+    rest = [g for g in rank_by_guid if g not in with_chat_set]
+    rest.sort(key=lambda g: rank_by_guid.get(g, 2))
 
-    ordered = with_chat + without_chat + [g for g, _ in groups]
+    ordered = with_chat + rest + [g for g, _ in groups]
     stats = {
         "contacts": len(contacts),
         "groups": len(groups),
