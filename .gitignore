@@ -1,0 +1,13 @@
+# Secrets
+.env
+
+# Data: database, sessions, downloaded media
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+venv/
+.venv/
