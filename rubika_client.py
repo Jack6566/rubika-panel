@@ -37,6 +37,39 @@ def open_client(phone: str) -> Client:
     return Client(name=session_path(phone))
 
 
+async def connect_ready(client: Client):
+    """Connect AND rebuild the signing material that rubpy's connect() omits.
+
+    connect.py only restores: client.auth, client.guid, client.private_key,
+    client.user_agent. But message signing also needs client.key,
+    client.decode_auth and client.import_key (see start.py lines ~38). Without
+    them you get: 'NoneType' object has no attribute 'sign'.
+    """
+    await client.connect()
+
+    auth = getattr(client, "auth", None)
+    private_key = getattr(client, "private_key", None)
+
+    try:
+        if auth is not None and getattr(client, "key", None) in (None, ""):
+            client.key = Crypto.passphrase(auth)
+    except Exception:
+        pass
+    try:
+        if auth is not None:
+            client.decode_auth = Crypto.decode_auth(auth)
+    except Exception:
+        pass
+    try:
+        if private_key is not None and getattr(client, "import_key", None) is None:
+            ik = _import_key_from_private(private_key)
+            if ik is not None:
+                client.import_key = ik
+    except Exception:
+        pass
+    return client
+
+
 def normalize_phone(phone: str) -> str:
     """Rubika expects digits with country code, no '+' and no leading 0.
     Examples: '+989121234567' -> '989121234567', '09121234567' -> '989121234567'
@@ -229,34 +262,52 @@ def _type_of(obj):
 
 
 # --------------------------------------------------------------------------- #
-# Recipients: contacts + groups
+# Recipients: contacts + groups (paginated; Rubika returns ~100 per page)
 # --------------------------------------------------------------------------- #
+def _next_start_id(result):
+    return _get(result, "next_start_id") or _get(result, "next_start_index")
+
+
 async def get_contacts(client: Client) -> list:
-    """Return a list of (guid, name) for contact users."""
-    result = await client.get_contacts()
-    users = getattr(result, "users", None)
-    if users is None and isinstance(result, dict):
-        users = result.get("users", [])
+    """Return a list of (guid, name) for ALL contact users (paginated)."""
     out = []
-    for u in users or []:
-        guid = _guid_of(u)
-        if guid:
-            out.append((guid, _name_of(u)))
+    seen = set()
+    start_id = None
+    for _ in range(200):  # hard safety cap (200 * ~100 = 20k contacts)
+        result = await client.get_contacts(start_id) if start_id else await client.get_contacts()
+        users = getattr(result, "users", None)
+        if users is None and isinstance(result, dict):
+            users = result.get("users", [])
+        for u in users or []:
+            guid = _guid_of(u)
+            if guid and guid not in seen:
+                seen.add(guid)
+                out.append((guid, _name_of(u)))
+        start_id = _next_start_id(result)
+        if not start_id or not users:
+            break
     return out
 
 
 async def get_groups(client: Client) -> list:
-    """Return a list of (guid, name) for every group the account is in."""
-    result = await client.get_chats()
-    chats = getattr(result, "chats", None)
-    if chats is None and isinstance(result, dict):
-        chats = result.get("chats", [])
+    """Return a list of (guid, name) for ALL groups the account is in (paginated)."""
     out = []
-    for chat in chats or []:
-        if _type_of(chat) == "group":
-            guid = _guid_of(chat)
-            if guid:
-                out.append((guid, _name_of(chat)))
+    seen = set()
+    start_id = None
+    for _ in range(200):
+        result = await client.get_chats(start_id) if start_id else await client.get_chats()
+        chats = getattr(result, "chats", None)
+        if chats is None and isinstance(result, dict):
+            chats = result.get("chats", [])
+        for chat in chats or []:
+            if _type_of(chat) == "group":
+                guid = _guid_of(chat)
+                if guid and guid not in seen:
+                    seen.add(guid)
+                    out.append((guid, _name_of(chat)))
+        start_id = _next_start_id(result)
+        if not start_id or not chats:
+            break
     return out
 
 
@@ -268,7 +319,68 @@ async def get_recipients(client: Client):
 
 
 # --------------------------------------------------------------------------- #
-# Sending
+# Find a marked message in Saved Messages (for forward-based sending)
+#   You put a file in your Rubika Saved Messages and end its caption with a
+#   marker like [کد135]. The bot finds that message and forwards it to everyone.
+# --------------------------------------------------------------------------- #
+def _msg_id_of(msg):
+    return (
+        _get(msg, "message_id")
+        or _get(msg, "id")
+        or (str(_get(msg, "message_id")) if _get(msg, "message_id") else None)
+    )
+
+
+def _msg_text_of(msg):
+    return (
+        _get(msg, "text")
+        or _get(msg, "caption")
+        or ""
+    )
+
+
+async def find_marked_message(client: Client, marker: str):
+    """Search the account's Saved Messages for a message whose text/caption
+    contains `marker`. Returns (saved_guid, message_id) or (saved_guid, None).
+    """
+    me = await client.get_me()
+    saved_guid = _guid_of(me)
+    if not saved_guid:
+        raise RuntimeError("could not resolve Saved Messages guid")
+
+    max_id = None
+    for _ in range(50):  # scan up to ~50 pages of recent saved messages
+        try:
+            if max_id:
+                result = await client.get_messages(saved_guid, max_id, "20")
+            else:
+                result = await client.get_messages(saved_guid, "0", "20")
+        except Exception:
+            break
+        messages = getattr(result, "messages", None)
+        if messages is None and isinstance(result, dict):
+            messages = result.get("messages", [])
+        if not messages:
+            break
+        for msg in messages:
+            if marker in _msg_text_of(msg):
+                return saved_guid, _msg_id_of(msg)
+        # paginate older
+        last = messages[-1]
+        max_id = _msg_id_of(last)
+        if not max_id:
+            break
+    return saved_guid, None
+
+
+async def forward_message(client: Client, from_guid: str, to_guid: str, message_id):
+    """Forward one already-uploaded message to a single recipient."""
+    ids = message_id if isinstance(message_id, list) else [message_id]
+    await client.forward_messages(from_guid, to_guid, ids)
+
+
+# --------------------------------------------------------------------------- #
+# Sending (direct send for text/photo/file)
 # --------------------------------------------------------------------------- #
 async def send_content(client: Client, guid: str, content: dict):
     """Send the configured content (text / photo / file) to one recipient."""
@@ -293,3 +405,4 @@ async def send_to_saved(client: Client, content: dict):
         raise RuntimeError("could not resolve self guid for saved-messages test")
     await send_content(client, guid, content)
     return guid
+

@@ -39,6 +39,10 @@ OWNER_ID = _int("OWNER_ID")
 ADMIN_IDS = _id_list("ADMIN_IDS")
 LOG_GROUP_ID = _int("LOG_GROUP_ID")
 SEND_DELAY = _float("SEND_DELAY", 0.5)
+# Marker placed at the END of a file's caption in your Rubika Saved Messages.
+# When set, the bot finds that marked message and FORWARDS it to everyone
+# (no re-upload). Leave empty to use the normal "set content" flow instead.
+FORWARD_MARKER = os.getenv("FORWARD_MARKER", "").strip()
 
 # Everyone allowed to use the bot = the owner + any extra admins
 ALLOWED_IDS = [i for i in ([OWNER_ID] + ADMIN_IDS) if i]

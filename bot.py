@@ -254,12 +254,16 @@ async def send_confirm_cb(event):
         await event.answer("اکانت پیدا نشد.", alert=True)
         return
     content = db.get_content()
-    if not content.get("content_type"):
-        await event.answer("اول محتوای ارسالی را تنظیم کن.", alert=True)
+    if not config.FORWARD_MARKER and not content.get("content_type"):
+        await event.answer("اول محتوای ارسالی را تنظیم کن (یا FORWARD_MARKER را ست کن).", alert=True)
         return
+    if config.FORWARD_MARKER:
+        what = f"📎 فوروارد پیام نشان‌دار از Saved Messages\n🔖 مارکر: {config.FORWARD_MARKER}"
+    else:
+        what = content_summary(content)
     await event.edit(
         f"🚀 شروع ارسال با اکانت {acc['phone']}؟\n\n"
-        f"محتوایی که ارسال می‌شود:\n{content_summary(content)}\n\n"
+        f"محتوایی که ارسال می‌شود:\n{what}\n\n"
         "گیرنده‌ها: مخاطبین + گروه‌ها\nمطمئنی؟",
         buttons=[
             [Button.inline("✅ بله، شروع کن", f"go_{account_id}".encode())],
@@ -490,36 +494,63 @@ async def do_send(account_id: int):
     acc = db.get_account(account_id)
     if not acc:
         return
+
+    use_forward = bool(config.FORWARD_MARKER)
     content = db.get_content()
-    if not content.get("content_type"):
+    if not use_forward and not content.get("content_type"):
         await log("⚠️ Broadcast cancelled: no content configured.")
         return
 
     client = rb.open_client(acc["phone"])
     try:
-        await client.connect()
+        # connect_ready rebuilds the signing keys (fixes 'NoneType has no sign')
+        await rb.connect_ready(client)
 
-        # --- Health test: send to Saved Messages first ---
-        try:
-            await rb.send_to_saved(client, content)
-        except Exception as e:  # noqa: BLE001
-            db.set_status(account_id, "dead")
-            await log(card("TEST FAILED ⚠️", [
-                f"📱 Phone : {acc['phone']}",
-                f"💥 Error : {e}",
-                "Account may be logged out or banned.",
-            ]))
-            return
+        # --- Resolve what we will send ---
+        fwd_from = None
+        fwd_msg_id = None
+        if use_forward:
+            try:
+                fwd_from, fwd_msg_id = await rb.find_marked_message(client, config.FORWARD_MARKER)
+            except Exception as e:  # noqa: BLE001
+                await log(card("TEST FAILED ⚠️", [
+                    f"📱 Phone : {acc['phone']}",
+                    f"💥 Error : {e}",
+                    "Could not read Saved Messages.",
+                ]))
+                return
+            if not fwd_msg_id:
+                await log(card("MARKER NOT FOUND ⚠️", [
+                    f"📱 Phone : {acc['phone']}",
+                    f"🔖 Marker: {config.FORWARD_MARKER}",
+                    "Put a file in Saved Messages whose caption ENDS with the marker.",
+                ]))
+                return
+        else:
+            # Health test: send to Saved Messages first
+            try:
+                await rb.send_to_saved(client, content)
+            except Exception as e:  # noqa: BLE001
+                db.set_status(account_id, "dead")
+                await log(card("TEST FAILED ⚠️", [
+                    f"📱 Phone : {acc['phone']}",
+                    f"💥 Error : {e}",
+                    "Account may be logged out or banned.",
+                ]))
+                return
 
         contacts, groups = await rb.get_recipients(client)
         recipients = [g for g, _ in contacts] + [g for g, _ in groups]
         total = len(recipients)
 
-        type_label = {"text": "Text", "photo": "Photo", "file": "File"}.get(
-            content["content_type"], "Content"
-        )
+        if use_forward:
+            type_label = "Forward (Saved Messages)"
+        else:
+            type_label = {"text": "Text", "photo": "Photo", "file": "File"}.get(
+                content["content_type"], "Content"
+            )
         caption = content.get("content_text")
-        is_media = content["content_type"] != "text"
+        is_media = (not use_forward) and content["content_type"] != "text"
 
         # Log: broadcast started
         await log(card("BROADCAST STARTED 🚀", [
@@ -542,7 +573,10 @@ async def do_send(account_id: int):
                 stopped_reason = "manual"
                 break
             try:
-                await rb.send_content(client, guid, content)
+                if use_forward:
+                    await rb.forward_message(client, fwd_from, guid, fwd_msg_id)
+                else:
+                    await rb.send_content(client, guid, content)
                 success += 1
             except Exception:  # noqa: BLE001
                 fail += 1
