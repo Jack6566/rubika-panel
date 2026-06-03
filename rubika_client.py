@@ -65,38 +65,64 @@ def _get(obj, *names):
     return None
 
 
-async def start_login(phone: str):
-    """Phase 1: connect + request SMS code.
+async def start_login(phone: str, pass_key: str = None):
+    """Phase 1: connect + request the login code.
 
-    Returns a dict with everything needed to finish the login later:
-    {client, phone, phone_code_hash, public_key, private_key}
+    Mirrors rubpy start.py: if the account has 2FA, send_code returns a status
+    asking for a pass_key; we expose that so the panel can ask for the password
+    and call start_login again WITH the pass_key.
+
+    Returns a dict:
+      {client, phone, status, phone_code_hash, hint, public_key, private_key}
     """
     phone = normalize_phone(phone)
-    client = Client(name=session_path(phone))
+    client = ctx_client = Client(name=session_path(phone))
     await client.connect()
 
     public_key, private_key = Crypto.create_keys()
 
-    sent = await client.send_code(phone_number=phone)
-    phone_code_hash = _get(sent, "phone_code_hash")
-    # Some versions wrap it differently
-    if phone_code_hash is None:
-        data = _get(sent, "data") or sent
-        phone_code_hash = _get(data, "phone_code_hash")
+    if pass_key:
+        result = await client.send_code(phone_number=phone, pass_key=pass_key)
+    else:
+        result = await client.send_code(phone_number=phone)
+
+    status = _get(result, "status") or ""
+    phone_code_hash = _get(result, "phone_code_hash")
+    hint = _get(result, "hint_pass_key")
 
     return {
-        "client": client,
+        "client": ctx_client,
         "phone": phone,
+        "status": status,
         "phone_code_hash": phone_code_hash,
+        "hint": hint,
         "public_key": public_key,
         "private_key": private_key,
     }
 
 
-async def finish_login(ctx: dict, code: str):
-    """Phase 2: sign in with the code, decrypt the auth key, register device.
+def _import_key_from_private(private_key):
+    """Build the signing key exactly like rubpy start.py does."""
+    try:
+        from Crypto.Hash import SHA256  # noqa: F401  (ensure pycryptodome present)
+        from Crypto.PublicKey import RSA
+        from Crypto.Signature import pkcs1_15
+        if private_key is not None:
+            return pkcs1_15.new(RSA.import_key(private_key.encode()))
+    except Exception:
+        pass
+    return None
 
-    Returns the rubpy client, now authorized and with its session saved.
+
+async def finish_login(ctx: dict, code: str):
+    """Phase 2: sign in with the code, then replicate start.py EXACTLY:
+        result.auth = Crypto.decrypt_RSA_OAEP(private_key, result.auth)
+        client.key  = Crypto.passphrase(result.auth)
+        client.auth = result.auth
+        client.decode_auth = Crypto.decode_auth(client.auth)
+        client.import_key  = pkcs1_15.new(RSA.import_key(private_key))
+        client.session.insert(auth, guid, user_agent, phone_number, private_key)
+        await client.register_device(device_model=client.name)
     """
     client: Client = ctx["client"]
     phone = ctx["phone"]
@@ -109,57 +135,53 @@ async def finish_login(ctx: dict, code: str):
         public_key=ctx["public_key"],
     )
 
-    # Decrypt the returned auth with our private key (as start.py does).
+    status = _get(result, "status") or ""
+    if str(status).upper() not in ("OK", ""):
+        # Not a success status (e.g. wrong code) -> let caller handle it.
+        raise RuntimeError(f"sign_in status: {status}")
+
+    # ---- Replicate start.py's post-sign-in steps precisely ----
     enc_auth = _get(result, "auth")
-    if enc_auth:
-        try:
-            decrypted = Crypto.decrypt_RSA_OAEP(private_key, enc_auth)
-        except Exception:
-            decrypted = enc_auth
-        # Persist auth/key onto the client so subsequent calls work.
-        for attr in ("auth", "key"):
-            try:
-                setattr(client, attr, decrypted)
-            except Exception:
-                pass
-        # rubpy keeps these on client.account / client.session in some versions
-        for holder in ("account", "session"):
-            obj = getattr(client, holder, None)
-            if obj is not None:
-                for attr in ("auth", "key"):
-                    try:
-                        setattr(obj, attr, decrypted)
-                    except Exception:
-                        pass
+    decrypted = Crypto.decrypt_RSA_OAEP(private_key, enc_auth)
+
+    client.private_key = private_key
+    client.key = Crypto.passphrase(decrypted)
+    client.auth = decrypted
+    try:
+        client.decode_auth = Crypto.decode_auth(client.auth)
+    except Exception:
+        pass
+    ik = _import_key_from_private(private_key)
+    if ik is not None:
+        client.import_key = ik
+
+    # Persist into the session store (start.py uses client.session.insert).
+    try:
+        user = _get(result, "user")
+        guid = _guid_of(user) or _guid_of(result)
+        phone_number = _get(user, "phone") or phone
+        user_agent = getattr(client, "user_agent", None)
+        client.session.insert(
+            auth=client.auth,
+            guid=guid,
+            user_agent=user_agent,
+            phone_number=phone_number,
+            private_key=private_key,
+        )
+    except Exception:
+        # Fallback: some versions auto-save; ignore if insert signature differs.
+        pass
 
     # Register device (start.py calls this right after a fresh sign-in).
     try:
-        await client.register_device(device_model="RubikaPanel")
+        await client.register_device(device_model=getattr(client, "name", "RubikaPanel"))
     except Exception:
         try:
             await client.register_device()
         except Exception:
             pass
 
-    # Make sure the session is persisted to disk.
-    for saver in ("save_session", "save", "_save_session"):
-        fn = getattr(client, saver, None)
-        if callable(fn):
-            try:
-                res = fn()
-                if hasattr(res, "__await__"):
-                    await res
-                break
-            except Exception:
-                continue
-
     return result
-
-
-async def needs_password(result) -> bool:
-    """Detect whether sign_in is asking for the 2FA password."""
-    status = _get(result, "status") or ""
-    return "pass" in str(status).lower() or "two" in str(status).lower()
 
 
 # --------------------------------------------------------------------------- #

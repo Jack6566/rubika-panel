@@ -340,14 +340,33 @@ async def handle_phone(event):
     except Exception as e:  # noqa: BLE001
         await event.respond(f"❌ خطا در ارسال کد: {e}\nدوباره شماره را بفرست یا لغو کن.")
         return
+
+    pending[event.sender_id] = ctx
+    status = str(ctx.get("status") or "").upper()
+
+    # If the account has 2FA, send_code asks for the password first.
+    if "PASS" in status:
+        hint = ctx.get("hint") or ""
+        state[event.sender_id] = {"step": "await_password"}
+        await event.respond(
+            "🔐 این اکانت رمز دومرحله‌ای دارد." + (f"\nراهنما: {hint}" if hint else "") +
+            "\nرمز را بفرست.",
+            buttons=[[Button.inline("🔙 لغو", b"cancel")]],
+        )
+        return
+
     if not ctx.get("phone_code_hash"):
         try:
             await ctx["client"].disconnect()
         except Exception:  # noqa: BLE001
             pass
-        await event.respond("❌ روبیکا کد نفرستاد (hash خالی). شماره را درست بفرست یا کمی بعد دوباره امتحان کن.")
+        pending.pop(event.sender_id, None)
+        await event.respond(
+            f"❌ روبیکا کد نفرستاد (status: {status or 'نامشخص'}). "
+            "شماره را درست بفرست یا کمی بعد دوباره امتحان کن."
+        )
         return
-    pending[event.sender_id] = ctx
+
     state[event.sender_id] = {"step": "await_code"}
     await event.respond(
         "📩 کد ورود در اپ روبیکا برایت آمد.\n"
@@ -363,31 +382,10 @@ async def handle_code(event):
         return
     code = "".join(ch for ch in event.raw_text if ch.isdigit())
     try:
-        result = await rb.finish_login(ctx, code)
+        await rb.finish_login(ctx, code)
     except Exception as e:  # noqa: BLE001
-        msg = str(e).lower()
-        if "pass" in msg or "2fa" in msg or "two" in msg:
-            state[event.sender_id] = {"step": "await_password"}
-            await event.respond(
-                "🔐 این اکانت رمز دومرحله‌ای دارد. رمز را بفرست.",
-                buttons=[[Button.inline("🔙 لغو", b"cancel")]],
-            )
-            return
         await event.respond(f"❌ کد اشتباه یا خطا: {e}\nدوباره کد را بفرست یا لغو کن.")
         return
-
-    # Some versions signal 2FA need via the result status instead of raising.
-    try:
-        if await rb.needs_password(result):
-            state[event.sender_id] = {"step": "await_password"}
-            await event.respond(
-                "🔐 این اکانت رمز دومرحله‌ای دارد. رمز را بفرست.",
-                buttons=[[Button.inline("🔙 لغو", b"cancel")]],
-            )
-            return
-    except Exception:  # noqa: BLE001
-        pass
-
     await complete_account(event)
 
 
@@ -397,19 +395,23 @@ async def handle_password(event):
         state.pop(event.sender_id, None)
         return
     password = event.raw_text.strip()
+    # In rubpy, the 2FA password is supplied to send_code(pass_key=...),
+    # which then returns a fresh phone_code_hash. We restart the code phase.
     try:
-        # Retry sign-in including the 2FA password.
-        await ctx["client"].sign_in(
-            phone_code=ctx.get("last_code", ""),
-            phone_number=ctx["phone"],
-            phone_code_hash=ctx["phone_code_hash"],
-            public_key=ctx["public_key"],
-            password=password,
-        )
+        new_ctx = await rb.start_login(ctx["phone"], pass_key=password)
     except Exception as e:  # noqa: BLE001
         await event.respond(f"❌ رمز اشتباه یا خطا: {e}\nدوباره رمز را بفرست.")
         return
-    await complete_account(event)
+    status = str(new_ctx.get("status") or "").upper()
+    if status not in ("OK", "SEND_PASS_KEY", ""):
+        await event.respond(f"❌ رمز پذیرفته نشد (status: {status}). دوباره رمز را بفرست.")
+        return
+    pending[event.sender_id] = new_ctx
+    state[event.sender_id] = {"step": "await_code"}
+    await event.respond(
+        "🔓 رمز پذیرفته شد. حالا کد ورود که در اپ روبیکا آمد را بفرست.",
+        buttons=[[Button.inline("🔙 لغو", b"cancel")]],
+    )
 
 
 async def complete_account(event):
