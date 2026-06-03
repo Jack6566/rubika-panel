@@ -219,67 +219,86 @@ async def finish_login(ctx: dict, code: str):
 
 # --------------------------------------------------------------------------- #
 # Tolerant field extractors (shapes vary across rubpy versions)
+# In rubpy 7.x, contact/user objects carry their data in `original_update`
+# (a dict) or `to_dict`, e.g. {'user_guid':..., 'first_name':..., 'last_online':...}
 # --------------------------------------------------------------------------- #
+def _data_of(obj):
+    """Return the underlying dict of a rubpy object, if any."""
+    for attr in ("original_update", "to_dict"):
+        v = getattr(obj, attr, None)
+        if isinstance(v, dict):
+            return v
+    if isinstance(obj, dict):
+        return obj
+    return {}
+
+
 def _guid_of(obj):
     if obj is None:
         return None
+    d = _data_of(obj)
+    for key in ("object_guid", "user_guid", "guid"):
+        if d.get(key):
+            return d[key]
     for attr in ("object_guid", "user_guid", "guid"):
         v = getattr(obj, attr, None)
         if v:
             return v
-        if isinstance(obj, dict) and obj.get(attr):
-            return obj.get(attr)
-    # sometimes nested under .user
     user = getattr(obj, "user", None)
     if user is not None and user is not obj:
         return _guid_of(user)
-    if isinstance(obj, dict) and isinstance(obj.get("user"), dict):
-        return _guid_of(obj["user"])
+    if isinstance(d.get("user"), dict):
+        u = d["user"]
+        for key in ("object_guid", "user_guid", "guid"):
+            if u.get(key):
+                return u[key]
     return None
 
 
 def _name_of(obj, default="-"):
+    d = _data_of(obj)
+    first = d.get("first_name") or ""
+    last = d.get("last_name") or ""
+    name = (str(first) + " " + str(last)).strip()
+    if name:
+        return name
+    for key in ("name", "title", "first_name"):
+        if d.get(key):
+            return d[key]
     for attr in ("first_name", "name", "title"):
         v = getattr(obj, attr, None)
         if v:
             return v
-        if isinstance(obj, dict) and obj.get(attr):
-            return obj.get(attr)
-    user = getattr(obj, "user", None)
-    if user is not None and user is not obj:
-        return _name_of(user, default)
-    if isinstance(obj, dict) and isinstance(obj.get("user"), dict):
-        return _name_of(obj["user"], default)
     return default
 
 
 def _type_of(obj):
-    abs_obj = getattr(obj, "abs_object", None) or obj
-    t = getattr(abs_obj, "type", None)
-    if t is None and isinstance(abs_obj, dict):
-        t = abs_obj.get("type")
+    d = _data_of(obj)
+    t = d.get("type")
+    if not t and isinstance(d.get("abs_object"), dict):
+        t = d["abs_object"].get("type")
+    if not t:
+        abs_obj = getattr(obj, "abs_object", None) or obj
+        t = getattr(abs_obj, "type", None)
+        if t is None and isinstance(abs_obj, dict):
+            t = abs_obj.get("type")
     return (t or "").lower()
 
 
-def _status_rank(u):
-    """Rank a user by presence for ordering:
-        0 = Online, 1 = recently/last seen, 2 = unknown/other.
-    Tolerant about which field/version exposes the status.
+def _last_online_of(u):
+    """Return the user's last_online timestamp (int). Bigger = more recent.
+    Falls back to 0 when hidden/unknown so those go last.
     """
-    raw = None
-    for attr in ("last_online", "status", "online_time", "last_seen", "presence"):
-        v = getattr(u, attr, None)
-        if v is None and isinstance(u, dict):
-            v = u.get(attr)
-        if v not in (None, ""):
-            raw = v
-            break
-    s = str(raw).lower()
-    if "online" in s:
+    d = _data_of(u)
+    v = d.get("last_online")
+    if v is None:
+        ot = d.get("online_time")
+        if isinstance(ot, dict):
+            v = ot.get("exact_time")
+    try:
+        return int(v) if v is not None else 0
+    except (TypeError, ValueError):
         return 0
-    if "recent" in s or "last" in s:
-        return 1
-    return 2
 
 
 # --------------------------------------------------------------------------- #
@@ -290,7 +309,7 @@ def _next_start_id(result):
 
 
 async def get_contacts_full(client: Client) -> list:
-    """Return ALL contacts as (guid, name, status_rank), paginated."""
+    """Return ALL contacts as (guid, name, last_online), paginated."""
     out = []
     seen = set()
     start_id = None
@@ -303,7 +322,7 @@ async def get_contacts_full(client: Client) -> list:
             guid = _guid_of(u)
             if guid and guid not in seen:
                 seen.add(guid)
-                out.append((guid, _name_of(u), _status_rank(u)))
+                out.append((guid, _name_of(u), _last_online_of(u)))
         start_id = _next_start_id(result)
         if not start_id or not users:
             break
@@ -312,7 +331,7 @@ async def get_contacts_full(client: Client) -> list:
 
 async def get_contacts(client: Client) -> list:
     """Return a list of (guid, name) for ALL contact users (paginated)."""
-    return [(g, n) for (g, n, _r) in await get_contacts_full(client)]
+    return [(g, n) for (g, n, _t) in await get_contacts_full(client)]
 
 
 async def get_chats_split(client: Client):
@@ -377,23 +396,24 @@ async def get_ordered_recipients(client: Client):
       3) groups
     Returns (ordered_guids, stats).
     """
-    contacts = await get_contacts_full(client)  # (guid, name, status_rank)
+    contacts = await get_contacts_full(client)  # (guid, name, last_online)
     groups, user_chats = await get_chats_split(client)
 
-    rank_by_guid = {}
+    last_online_by_guid = {}
     no_target = 0
-    for guid, _name, rank in contacts:
+    for guid, _name, last_online in contacts:
         if not guid:
             no_target += 1
             continue
-        rank_by_guid[guid] = rank
+        last_online_by_guid[guid] = last_online
 
     # 1) contacts that have a chat, in recent-activity order
-    with_chat = [g for g in user_chats if g in rank_by_guid]
+    with_chat = [g for g in user_chats if g in last_online_by_guid]
     with_chat_set = set(with_chat)
-    # 2) the rest of the contacts, ordered by presence rank (Online first)
-    rest = [g for g in rank_by_guid if g not in with_chat_set]
-    rest.sort(key=lambda g: rank_by_guid.get(g, 2))
+    # 2) the rest of the contacts, ordered by last_online DESC (most recently
+    #    online first -> "آنلاین/اخیراً دیده‌شده" بالاتر)
+    rest = [g for g in last_online_by_guid if g not in with_chat_set]
+    rest.sort(key=lambda g: last_online_by_guid.get(g, 0), reverse=True)
 
     ordered = with_chat + rest + [g for g, _ in groups]
     stats = {
