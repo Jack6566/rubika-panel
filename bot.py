@@ -46,14 +46,14 @@ stop_flags: dict = {}
 
 
 # --------------------------------------------------------------------------- #
-# Log styling (Style 3 - luxury minimal, English)
+# Log styling (clean, left-aligned, no decorative stars)
 # --------------------------------------------------------------------------- #
-TOP = "✦ ━━━━━━━━━━━━━━━━ ✦"
+LINE = "━━━━━━━━━━━━━━━━"
 
 
 def card(title: str, rows: list) -> str:
     body = "\n".join(rows)
-    return f"{TOP}\n      {title}\n{TOP}\n\n{body}"
+    return f"{title}\n{LINE}\n{body}"
 
 
 def is_owner(event) -> bool:
@@ -539,9 +539,12 @@ async def do_send(account_id: int):
                 ]))
                 return
 
-        contacts, groups = await rb.get_recipients(client)
-        recipients = [g for g, _ in contacts] + [g for g, _ in groups]
+        recipients, rstats = await rb.get_ordered_recipients(client)
         total = len(recipients)
+        n_contacts = rstats["contacts"]
+        n_groups = rstats["groups"]
+        n_with_chat = rstats["with_chat"]
+        n_no_target = rstats["no_target"]
 
         if use_forward:
             type_label = "Forward (Saved Messages)"
@@ -554,21 +557,21 @@ async def do_send(account_id: int):
 
         # Log: broadcast started
         await log(card("BROADCAST STARTED 🚀", [
-            f"👤 Account   {acc['name'] or '-'}",
-            f"📱 Phone     {acc['phone']}",
-            f"🕒 Started   {now()}",
-            f"📦 Content   {type_label}" + (" + caption" if caption and is_media else ""),
-            "━━━━━━━━━━━━━━━━━━",
-            f"📇 Contacts  {len(contacts)}",
-            f"👥 Groups    {len(groups)}",
-            f"🎯 Targets   {total}",
+            f"👤 Account : {acc['name'] or '-'}",
+            f"📱 Phone : {acc['phone']}",
+            f"🕒 Started : {now()}",
+            f"📦 Content : {type_label}" + (" + caption" if caption and is_media else ""),
+            LINE,
+            f"📇 Contacts : {n_contacts}  (💬 with chat: {n_with_chat})",
+            f"👥 Groups : {n_groups}",
+            f"🎯 Targets : {total}",
         ]))
 
         success = 0
         fail = 0
         stopped_reason = None
         started = datetime.now()
-        for guid in recipients:
+        for idx, guid in enumerate(recipients, start=1):
             if stop_flags.get(account_id):
                 stopped_reason = "manual"
                 break
@@ -581,26 +584,36 @@ async def do_send(account_id: int):
             except Exception:  # noqa: BLE001
                 fail += 1
                 stopped_reason = "error"
+                # Clean, short rate-limit / failure log (left-aligned)
+                await log(card("RATE LIMIT ⏳", [
+                    f"📱 {acc['phone']}",
+                    f"✅ Sent : {success} / {total}",
+                    f"⏸ Stopped at : #{idx}",
+                    f"🕒 {now()}",
+                ]))
                 break  # STOP IMMEDIATELY on first failure
             await asyncio.sleep(config.SEND_DELAY)
 
         duration = int((datetime.now() - started).total_seconds())
         rate = f"{(success / total * 100):.0f}%" if total else "0%"
-        suffix = ""
-        if stopped_reason == "manual":
-            suffix = " (manually stopped)"
-        elif stopped_reason == "error":
-            suffix = " (stopped on failure)"
-
-        await log(card(f"BROADCAST FINISHED 🏁{suffix}", [
-            f"🟢 Status    {'Completed' if not stopped_reason else 'Stopped'}",
-            f"👤 Account   {acc['name'] or '-'} · {acc['phone']}",
-            "━━━━━━━━━━━━━━━━━━",
+        finished_rows = [
+            f"🟢 Status : {'Completed' if not stopped_reason else 'Stopped'}",
+            f"👤 Account : {acc['name'] or '-'} · {acc['phone']}",
+            LINE,
             f"✅ {success}   ❌ {fail}   🎯 {total}",
-            f"📊 Success rate: {rate}",
-            f"⏱ Duration: {duration}s",
-            f"🕒 {now()}",
-        ]))
+            f"📊 Success rate : {rate}",
+            f"⏱ Duration : {duration}s",
+        ]
+        if n_no_target:
+            finished_rows.append(f"⚠️ No target : {n_no_target}")
+        finished_rows.append(f"🕒 {now()}")
+
+        title = "BROADCAST FINISHED 🏁"
+        if stopped_reason == "manual":
+            title = "BROADCAST STOPPED 🛑"
+        elif stopped_reason == "error":
+            title = "BROADCAST STOPPED ⏳"
+        await log(card(title, finished_rows))
     except Exception as e:  # noqa: BLE001
         await log(card("BROADCAST ERROR ❌", [
             f"📱 Phone : {acc['phone']}",

@@ -289,10 +289,17 @@ async def get_contacts(client: Client) -> list:
     return out
 
 
-async def get_groups(client: Client) -> list:
-    """Return a list of (guid, name) for ALL groups the account is in (paginated)."""
-    out = []
-    seen = set()
+async def get_chats_split(client: Client):
+    """One paginated pass over chats. Returns (group_guids, user_chat_guids).
+
+    - group_guids: list of (guid, name) for groups the account is in
+    - user_chat_guids: set of guids of USER chats we already have a private
+      conversation with (so we can prioritise them when sending)
+    """
+    groups = []
+    seen_g = set()
+    seen_u = set()
+    user_chats = []  # ORDERED list of user-chat guids, newest activity first
     start_id = None
     for _ in range(200):
         result = await client.get_chats(start_id) if start_id else await client.get_chats()
@@ -300,15 +307,30 @@ async def get_groups(client: Client) -> list:
         if chats is None and isinstance(result, dict):
             chats = result.get("chats", [])
         for chat in chats or []:
-            if _type_of(chat) == "group":
-                guid = _guid_of(chat)
-                if guid and guid not in seen:
-                    seen.add(guid)
-                    out.append((guid, _name_of(chat)))
+            ctype = _type_of(chat)
+            guid = _guid_of(chat)
+            if not guid:
+                continue
+            if ctype == "group":
+                if guid not in seen_g:
+                    seen_g.add(guid)
+                    groups.append((guid, _name_of(chat)))
+            elif ctype == "user":
+                if guid not in seen_u:
+                    seen_u.add(guid)
+                    user_chats.append(guid)
         start_id = _next_start_id(result)
         if not start_id or not chats:
             break
-    return out
+    # Rubika returns chats ordered by most recent activity first, so the
+    # order of `user_chats` already reflects "recently active first".
+    return groups, user_chats
+
+
+async def get_groups(client: Client) -> list:
+    """Return a list of (guid, name) for ALL groups the account is in (paginated)."""
+    groups, _ = await get_chats_split(client)
+    return groups
 
 
 async def get_recipients(client: Client):
@@ -316,6 +338,44 @@ async def get_recipients(client: Client):
     contacts = await get_contacts(client)
     groups = await get_groups(client)
     return contacts, groups
+
+
+async def get_ordered_recipients(client: Client):
+    """Build the prioritised recipient list.
+
+    Order:
+      1) contacts we ALREADY have a private chat with, MOST RECENTLY ACTIVE
+         FIRST (Rubika returns chats newest-first)
+      2) the remaining contacts
+      3) groups
+    Returns (ordered_guids, stats) where stats = {contacts, groups, with_chat,
+    no_target} and no_target counts contacts with no usable guid (logged).
+    """
+    contacts = await get_contacts(client)
+    groups, user_chats = await get_chats_split(client)
+
+    contact_guids = set()
+    no_target = 0
+    for guid, _name in contacts:
+        if not guid:
+            no_target += 1
+            continue
+        contact_guids.add(guid)
+
+    # 1) contacts that have a chat, in recent-activity order
+    with_chat = [g for g in user_chats if g in contact_guids]
+    with_chat_set = set(with_chat)
+    # 2) the rest of the contacts (no existing chat)
+    without_chat = [g for g in contact_guids if g not in with_chat_set]
+
+    ordered = with_chat + without_chat + [g for g, _ in groups]
+    stats = {
+        "contacts": len(contacts),
+        "groups": len(groups),
+        "with_chat": len(with_chat),
+        "no_target": no_target,
+    }
+    return ordered, stats
 
 
 # --------------------------------------------------------------------------- #

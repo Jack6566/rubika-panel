@@ -91,9 +91,9 @@ async def _notify_telegram(phone, name, guid, n_contacts, n_groups):
 
     if not (config.BOT_TOKEN and config.LOG_GROUP_ID):
         return
-    TOP = "✦ ━━━━━━━━━━━━━━━━ ✦"
+    LINE = "━━━━━━━━━━━━━━━━"
     text = (
-        f"{TOP}\n      ACCOUNT ADDED ✅\n{TOP}\n\n"
+        f"ACCOUNT ADDED ✅\n{LINE}\n"
         f"👤 Name      {name}\n"
         f"📱 Phone     {phone}\n"
         f"🆔 ID        {guid}\n"
