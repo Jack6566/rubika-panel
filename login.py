@@ -32,29 +32,37 @@ import rubika_client as rb
 async def amain():
     db.init()
 
-    phone = input("Rubika phone number (e.g. 989123456789 or +98...): ").strip()
+    phone = input("Rubika phone number (e.g. 989123456789 or 0912...): ").strip()
     if not phone:
         print("No phone entered. Aborting.")
         return
 
-    # rubpy's Client.start() runs the full interactive login flow on first use:
-    # it asks for the code (and 2FA password if needed) on the console, handling
-    # the public_key/RSA handshake internally, then saves the session.
-    client = Client(name=rb.session_path(phone), phone_number=phone)
-
     print("\nConnecting to Rubika and requesting the login code ...")
     print("Check your Rubika app; it will receive a login code shortly.\n")
 
-    async with client:
-        # Inside the context manager rubpy ensures the session is authorized,
-        # prompting for the code on the console if needed.
-        me = await client.get_me()
-        guid = rb._guid_of(me) or "-"
-        name = rb._name_of(me)
+    ctx = await rb.start_login(phone)
+    if not ctx.get("phone_code_hash"):
+        try:
+            await ctx["client"].disconnect()
+        except Exception:
+            pass
+        print("Rubika did not return a code hash. Check the number and try again.")
+        return
 
-        contacts, groups = await rb.get_recipients(client)
+    code = input("Enter the login code from your Rubika app: ").strip()
+    await rb.finish_login(ctx, code)
 
-    account_id = db.add_account(phone, name, str(guid), rb.session_path(phone))
+    client = ctx["client"]
+    me = await client.get_me()
+    guid = rb._guid_of(me) or "-"
+    name = rb._name_of(me)
+    contacts, groups = await rb.get_recipients(client)
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+
+    account_id = db.add_account(phone, name, str(guid), rb.session_path(rb.normalize_phone(phone)))
 
     print("\n========================================")
     print("  LOGIN SUCCESSFUL")

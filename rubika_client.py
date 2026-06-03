@@ -18,6 +18,7 @@ Inspect the installed rubpy API on the server:
 import os
 
 from rubpy import Client
+from rubpy.crypto import Crypto
 
 SESSIONS_DIR = os.path.join(os.path.dirname(__file__), "data", "sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
@@ -34,6 +35,131 @@ def open_client(phone: str) -> Client:
     For an already-authorized session, connect() loads it without prompting.
     """
     return Client(name=session_path(phone))
+
+
+def normalize_phone(phone: str) -> str:
+    """Rubika expects digits with country code, no '+' and no leading 0.
+    Examples: '+989121234567' -> '989121234567', '09121234567' -> '989121234567'
+    """
+    p = "".join(ch for ch in phone if ch.isdigit())
+    if p.startswith("0"):
+        p = "98" + p[1:]
+    return p
+
+
+# --------------------------------------------------------------------------- #
+# Programmatic login (mirrors rubpy's own start.py flow)
+#   1) public_key, private_key = Crypto.create_keys()
+#   2) send_code(phone_number=...) -> phone_code_hash
+#   3) sign_in(phone_code, phone_number, phone_code_hash, public_key)
+#   4) result.auth = Crypto.decrypt_RSA_OAEP(private_key, result.auth)
+#   5) store auth/key into client, register_device, save session
+# --------------------------------------------------------------------------- #
+def _get(obj, *names):
+    for n in names:
+        v = getattr(obj, n, None)
+        if v not in (None, ""):
+            return v
+        if isinstance(obj, dict) and obj.get(n) not in (None, ""):
+            return obj.get(n)
+    return None
+
+
+async def start_login(phone: str):
+    """Phase 1: connect + request SMS code.
+
+    Returns a dict with everything needed to finish the login later:
+    {client, phone, phone_code_hash, public_key, private_key}
+    """
+    phone = normalize_phone(phone)
+    client = Client(name=session_path(phone))
+    await client.connect()
+
+    public_key, private_key = Crypto.create_keys()
+
+    sent = await client.send_code(phone_number=phone)
+    phone_code_hash = _get(sent, "phone_code_hash")
+    # Some versions wrap it differently
+    if phone_code_hash is None:
+        data = _get(sent, "data") or sent
+        phone_code_hash = _get(data, "phone_code_hash")
+
+    return {
+        "client": client,
+        "phone": phone,
+        "phone_code_hash": phone_code_hash,
+        "public_key": public_key,
+        "private_key": private_key,
+    }
+
+
+async def finish_login(ctx: dict, code: str):
+    """Phase 2: sign in with the code, decrypt the auth key, register device.
+
+    Returns the rubpy client, now authorized and with its session saved.
+    """
+    client: Client = ctx["client"]
+    phone = ctx["phone"]
+    private_key = ctx["private_key"]
+
+    result = await client.sign_in(
+        phone_code=code,
+        phone_number=phone,
+        phone_code_hash=ctx["phone_code_hash"],
+        public_key=ctx["public_key"],
+    )
+
+    # Decrypt the returned auth with our private key (as start.py does).
+    enc_auth = _get(result, "auth")
+    if enc_auth:
+        try:
+            decrypted = Crypto.decrypt_RSA_OAEP(private_key, enc_auth)
+        except Exception:
+            decrypted = enc_auth
+        # Persist auth/key onto the client so subsequent calls work.
+        for attr in ("auth", "key"):
+            try:
+                setattr(client, attr, decrypted)
+            except Exception:
+                pass
+        # rubpy keeps these on client.account / client.session in some versions
+        for holder in ("account", "session"):
+            obj = getattr(client, holder, None)
+            if obj is not None:
+                for attr in ("auth", "key"):
+                    try:
+                        setattr(obj, attr, decrypted)
+                    except Exception:
+                        pass
+
+    # Register device (start.py calls this right after a fresh sign-in).
+    try:
+        await client.register_device(device_model="RubikaPanel")
+    except Exception:
+        try:
+            await client.register_device()
+        except Exception:
+            pass
+
+    # Make sure the session is persisted to disk.
+    for saver in ("save_session", "save", "_save_session"):
+        fn = getattr(client, saver, None)
+        if callable(fn):
+            try:
+                res = fn()
+                if hasattr(res, "__await__"):
+                    await res
+                break
+            except Exception:
+                continue
+
+    return result
+
+
+async def needs_password(result) -> bool:
+    """Detect whether sign_in is asking for the 2FA password."""
+    status = _get(result, "status") or ""
+    return "pass" in str(status).lower() or "two" in str(status).lower()
 
 
 # --------------------------------------------------------------------------- #
