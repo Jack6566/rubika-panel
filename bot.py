@@ -135,10 +135,19 @@ async def cancel_cb(event):
 async def add_account_cb(event):
     if not is_owner(event):
         return
-    state[event.sender_id] = {"step": "await_phone"}
     await event.edit(
-        "📱 شماره اکانت روبیکا را همراه کد کشور بفرست.\nمثال: `+989121234567`",
-        buttons=[[Button.inline("🔙 لغو", b"cancel")]],
+        "➕ افزودن اکانت روبیکا\n\n"
+        "به‌خاطر روش ورود رمزنگاری‌شده‌ی روبیکا، افزودن اکانت یک‌بار روی سرور انجام می‌شود "
+        "(خیلی ساده است):\n\n"
+        "۱) وارد سرور شو و این را بزن:\n"
+        "`cd /opt/rubika-panel && source venv/bin/activate`\n\n"
+        "۲) بعد این را بزن:\n"
+        "`python login.py`\n\n"
+        "۳) شماره را وارد کن، کدی که در اپ روبیکا آمد را بزن (و رمز دومرحله‌ای اگر داشتی).\n\n"
+        "۴) بعد ربات را ری‌استارت کن:\n"
+        "`systemctl restart rubika-panel`\n\n"
+        "اکانت در «👥 مدیریت اکانت‌ها» ظاهر می‌شود. ✅",
+        buttons=[[Button.inline("🔙 بازگشت", b"home")]],
     )
 
 
@@ -321,128 +330,8 @@ async def message_router(event):
         return
     step = st.get("step")
 
-    if step == "await_phone":
-        await handle_phone(event)
-    elif step == "await_code":
-        await handle_code(event)
-    elif step == "await_password":
-        await handle_password(event)
-    elif step == "await_content":
+    if step == "await_content":
         await handle_content(event)
-
-
-async def handle_phone(event):
-    phone = event.raw_text.strip().replace(" ", "")
-    try:
-        client, phone_code_hash = await rb.send_login_code(phone)
-    except Exception as e:  # noqa: BLE001
-        await event.respond(f"❌ خطا در ارسال کد: {e}")
-        return
-    pending[event.sender_id] = {"client": client, "phone": phone, "hash": phone_code_hash}
-    state[event.sender_id] = {"step": "await_code"}
-    await event.respond(
-        "📩 کد تأیید برای اکانت روبیکا ارسال شد.\n"
-        "کد را بفرست (با فاصله یا بدون فاصله، هر دو قبول است).",
-        buttons=[[Button.inline("🔙 لغو", b"cancel")]],
-    )
-
-
-async def handle_code(event):
-    p = pending.get(event.sender_id)
-    if not p:
-        state.pop(event.sender_id, None)
-        return
-    code = "".join(ch for ch in event.raw_text if ch.isdigit())
-    try:
-        result = await rb.sign_in_with_code(p["client"], p["phone"], p["hash"], code)
-    except Exception as e:  # noqa: BLE001
-        msg = str(e).lower()
-        if "password" in msg or "2fa" in msg or "two" in msg:
-            state[event.sender_id] = {"step": "await_password"}
-            await event.respond(
-                "🔐 این اکانت رمز دومرحله‌ای دارد. رمز را بفرست.",
-                buttons=[[Button.inline("🔙 لغو", b"cancel")]],
-            )
-            return
-        await event.respond(f"❌ کد اشتباه یا خطا: {e}\nدوباره کد را بفرست یا لغو کن.")
-        return
-    await finish_login(event)
-
-
-async def handle_password(event):
-    p = pending.get(event.sender_id)
-    if not p:
-        state.pop(event.sender_id, None)
-        return
-    try:
-        # rubpy versions that support 2FA accept a password kwarg on sign_in.
-        await p["client"].sign_in(
-            phone_number=p["phone"], phone_code_hash=p["hash"], password=event.raw_text.strip()
-        )
-    except Exception as e:  # noqa: BLE001
-        await event.respond(f"❌ رمز اشتباه یا خطا: {e}\nدوباره رمز را بفرست.")
-        return
-    await finish_login(event)
-
-
-async def finish_login(event):
-    p = pending.pop(event.sender_id, None)
-    state.pop(event.sender_id, None)
-    if not p:
-        return
-    client = p["client"]
-    phone = p["phone"]
-    try:
-        me = await rb.finalize_login(client)
-        guid = rb._guid_of(me) or rb._guid_of(getattr(me, "user", me)) or "-"
-        first = (
-            getattr(me, "first_name", None)
-            or getattr(getattr(me, "user", None), "first_name", None)
-            or "-"
-        )
-        session_str = rb.session_path(phone)
-
-        contacts, groups = await rb.get_recipients(client)
-
-        account_id = db.add_account(phone, first, str(guid), session_str)
-
-        # Log: account added
-        await log(card("NEW ACCOUNT ➕", [
-            f"📱 Phone : {phone}",
-            f"🕒 Time  : {now()}",
-        ]))
-        # Log: login success
-        await log(card("LOGIN SUCCESS ✅", [
-            f"📱 Phone : {phone}",
-            f"🕒 Time  : {now()}",
-        ]))
-        # Log: account status with counts
-        await log(card("ACCOUNT STATUS 📇", [
-            f"👤 Name      {first}",
-            f"📱 Phone     {phone}",
-            f"🆔 ID        {guid}",
-            "━━━━━━━━━━━━━━━━━━",
-            f"📇 Contacts  {len(contacts)}",
-            f"👥 Groups    {len(groups)}",
-        ]))
-
-        await event.respond(
-            "✅ اکانت با موفقیت اضافه شد!\n"
-            f"👤 {first} | 📱 {phone}\n"
-            f"📇 مخاطبین: {len(contacts)} | 👥 گروه‌ها: {len(groups)}\n\n"
-            "میتوانی همین حالا ارسال را شروع کنی 👇",
-            buttons=[
-                [Button.inline("🚀 شروع ارسال", f"send_{account_id}".encode())],
-                [Button.inline("🏠 منوی اصلی", b"home")],
-            ],
-        )
-    except Exception as e:  # noqa: BLE001
-        await event.respond(f"❌ خطا بعد از ورود: {e}")
-    finally:
-        try:
-            await client.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
 
 
 async def handle_content(event):
@@ -476,7 +365,7 @@ async def do_send(account_id: int):
         await log("⚠️ Broadcast cancelled: no content configured.")
         return
 
-    client = rb.new_client(acc["phone"])
+    client = rb.open_client(acc["phone"])
     try:
         await client.connect()
 
