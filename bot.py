@@ -604,10 +604,20 @@ async def do_send(account_id: int):
                 msg = str(e)
                 is_rate = "TOO_REQUESTS" in msg or "TooRequests" in type(e).__name__
                 if is_rate:
-                    # Real Rubika rate limit -> wait long, then RETRY same target
+                    # Real Rubika rate limit.
                     rate_limit_hits += 1
+                    # If we're rate-limited from the VERY START (nothing sent yet)
+                    # the account is in cooldown -> stop fast, don't hang for hours.
+                    if success == 0 and rate_limit_hits >= 3:
+                        stopped_reason = "cooldown"
+                        await log(card("ACCOUNT COOLDOWN ⏳", [
+                            f"📱 {acc['phone']}",
+                            "روبیکا این اکانت را موقتاً محدود کرده (cooldown).",
+                            "چند ساعت دیگر دوباره امتحان کن.",
+                            f"🕒 {now()}",
+                        ]))
+                        break
                     if rate_limit_hits > 6:
-                        # repeatedly limited even after waiting -> stop cleanly
                         stopped_reason = "error"
                         await log(card("RATE LIMIT ⏳", [
                             f"📱 {acc['phone']}",
@@ -625,19 +635,31 @@ async def do_send(account_id: int):
                             f"🕒 {now()}",
                         ]))
                         notified_wait = True
-                    await asyncio.sleep(config.RATE_LIMIT_WAIT)
+                    # Sleep in 1s chunks so the STOP button responds immediately.
+                    waited = 0.0
+                    while waited < config.RATE_LIMIT_WAIT:
+                        if stop_flags.get(account_id):
+                            break
+                        await asyncio.sleep(1)
+                        waited += 1
                     # do NOT advance idx -> retry the same recipient
                     continue
                 else:
                     # transient glitch -> retry once, then skip
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)
                     try:
                         await _send_once()
                         success += 1
                     except Exception:  # noqa: BLE001
                         fail += 1
                     idx += 1
-            await asyncio.sleep(per_delay)
+            # normal gap between sends, but stay responsive to STOP
+            slept = 0.0
+            while slept < per_delay:
+                if stop_flags.get(account_id):
+                    break
+                await asyncio.sleep(min(0.5, per_delay - slept))
+                slept += 0.5
 
         duration = int((datetime.now() - started).total_seconds())
         rate = f"{(success / total * 100):.0f}%" if total else "0%"
