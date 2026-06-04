@@ -507,11 +507,17 @@ async def do_send(account_id: int):
         await rb.connect_ready(client)
 
         # --- Resolve what we will send ---
-        fwd_from = None
-        fwd_msg_id = None
+        # In forward mode we DON'T forward (Rubika rate-limits forwards hard).
+        # Instead we DOWNLOAD the marked file ONCE and send it DIRECTLY with
+        # send_document to each recipient (direct sends are not rate-limited
+        # the way forwards are).
+        marked_path = None
+        marked_caption = ""
         if use_forward:
             try:
-                fwd_from, fwd_msg_id = await rb.find_marked_message(client, config.FORWARD_MARKER)
+                marked_path, marked_caption, _msg = await rb.download_marked_file(
+                    client, config.FORWARD_MARKER
+                )
             except Exception as e:  # noqa: BLE001
                 await log(card("TEST FAILED ⚠️", [
                     f"📱 Phone : {acc['phone']}",
@@ -519,11 +525,11 @@ async def do_send(account_id: int):
                     "Could not read Saved Messages.",
                 ]))
                 return
-            if not fwd_msg_id:
+            if not marked_path:
                 await log(card("MARKER NOT FOUND ⚠️", [
                     f"📱 Phone : {acc['phone']}",
                     f"🔖 Marker: {config.FORWARD_MARKER}",
-                    "Put a file in Saved Messages whose caption ENDS with the marker.",
+                    "یک فایل در Saved Messages بگذار که کپشنش به مارکر ختم شود.",
                 ]))
                 return
         else:
@@ -547,13 +553,13 @@ async def do_send(account_id: int):
         n_no_target = rstats["no_target"]
 
         if use_forward:
-            type_label = "Forward (Saved Messages)"
+            type_label = "File (direct, from Saved)"
         else:
             type_label = {"text": "Text", "photo": "Photo", "file": "File"}.get(
                 content["content_type"], "Content"
             )
-        caption = content.get("content_text")
-        is_media = (not use_forward) and content["content_type"] != "text"
+        caption = marked_caption if use_forward else content.get("content_text")
+        is_media = True if use_forward else (content["content_type"] != "text")
 
         # Log: broadcast started
         await log(card("BROADCAST STARTED 🚀", [
@@ -570,8 +576,7 @@ async def do_send(account_id: int):
         success = 0
         fail = 0
         stopped_reason = None
-        # delay depends on mode: forwarding is rate-limited much harder
-        per_delay = config.FORWARD_DELAY if use_forward else config.SEND_DELAY
+        per_delay = config.SEND_DELAY   # direct sends -> the normal small delay
         rate_limit_hits = 0
         notified_wait = False
         started = datetime.now()
@@ -584,7 +589,7 @@ async def do_send(account_id: int):
 
             async def _send_once():
                 if use_forward:
-                    await rb.forward_message(client, fwd_from, guid, fwd_msg_id)
+                    await rb.send_document_direct(client, guid, marked_path, marked_caption)
                 else:
                     await rb.send_content(client, guid, content)
 

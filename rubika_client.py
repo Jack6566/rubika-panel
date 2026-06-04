@@ -448,7 +448,8 @@ def _msg_text_of(msg):
 
 async def find_marked_message(client: Client, marker: str):
     """Search the account's Saved Messages for a message whose text/caption
-    contains `marker`. Returns (saved_guid, message_id) or (saved_guid, None).
+    contains `marker`. Returns (saved_guid, message_id, message_obj) or
+    (saved_guid, None, None).
     """
     me = await client.get_me()
     saved_guid = _guid_of(me)
@@ -471,19 +472,39 @@ async def find_marked_message(client: Client, marker: str):
             break
         for msg in messages:
             if marker in _msg_text_of(msg):
-                return saved_guid, _msg_id_of(msg)
+                return saved_guid, _msg_id_of(msg), msg
         # paginate older
         last = messages[-1]
         max_id = _msg_id_of(last)
         if not max_id:
             break
-    return saved_guid, None
+    return saved_guid, None, None
 
 
-async def forward_message(client: Client, from_guid: str, to_guid: str, message_id):
-    """Forward one already-uploaded message to a single recipient."""
-    ids = message_id if isinstance(message_id, list) else [message_id]
-    await client.forward_messages(from_guid, to_guid, ids)
+async def download_marked_file(client: Client, marker: str):
+    """Find the marked message in Saved Messages, download its file ONCE, and
+    return (file_path, caption_without_marker, message_obj). The caption has the
+    marker stripped so it isn't shown to recipients.
+    """
+    saved_guid, mid, msg = await find_marked_message(client, marker)
+    if not mid or msg is None:
+        return None, None, None
+    caption = _msg_text_of(msg).replace(marker, "").strip()
+    path = None
+    try:
+        path = await client.download(msg)
+    except Exception:
+        # some versions: download by message id
+        try:
+            path = await client.download(saved_guid, mid)
+        except Exception:
+            path = None
+    return path, caption, msg
+
+
+async def send_document_direct(client: Client, guid: str, file_path: str, caption: str = ""):
+    """Send a document/file DIRECTLY to one recipient (not a forward)."""
+    await client.send_document(guid, file_path, caption=caption or "")
 
 
 # --------------------------------------------------------------------------- #
@@ -495,8 +516,10 @@ async def send_content(client: Client, guid: str, content: dict):
     caption = content.get("content_text") or ""
     if ct == "text":
         await client.send_message(guid, content.get("content_text") or "")
-    elif ct in ("photo", "file"):
-        await client.send_file(guid, file=content["media_path"], caption=caption)
+    elif ct == "photo":
+        await client.send_photo(guid, content["media_path"], caption=caption)
+    elif ct == "file":
+        await client.send_document(guid, content["media_path"], caption=caption)
     else:
         raise ValueError(f"unknown content type: {ct}")
 
