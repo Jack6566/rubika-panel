@@ -553,21 +553,20 @@ async def do_send(account_id: int):
         n_with_chat = rstats["with_chat"]
         n_no_target = rstats["no_target"]
 
-        if use_forward:
-            type_label = "File (direct, from Saved)"
-        else:
-            type_label = {"text": "Text", "photo": "Photo", "file": "File"}.get(
-                content["content_type"], "Content"
-            )
         caption = marked_caption if use_forward else content.get("content_text")
-        is_media = True if use_forward else (content["content_type"] != "text")
+
+        async def _send_to(guid):
+            if use_forward:
+                await rb.send_document_direct(client, guid, marked_path, marked_caption,
+                                              file_name=marked_name)
+            else:
+                await rb.send_content(client, guid, content)
 
         # Log: broadcast started
         await log(card("BROADCAST STARTED 🚀", [
             f"👤 Account : {acc['name'] or '-'}",
             f"📱 Phone : {acc['phone']}",
             f"🕒 Started : {now()}",
-            f"📦 Content : {type_label}" + (" + caption" if caption and is_media else ""),
             LINE,
             f"📇 Contacts : {n_contacts}  (💬 with chat: {n_with_chat})",
             f"👥 Groups : {n_groups}",
@@ -577,89 +576,50 @@ async def do_send(account_id: int):
         success = 0
         fail = 0
         stopped_reason = None
-        per_delay = config.SEND_DELAY   # direct sends -> the normal small delay
-        rate_limit_hits = 0
-        notified_wait = False
         started = datetime.now()
-        idx = 0
-        while idx < len(recipients):
+
+        # ---- STEP 1: probe the first 5 recipients ----
+        probe_n = min(5, total)
+        probe_ok = 0
+        for i in range(probe_n):
             if stop_flags.get(account_id):
                 stopped_reason = "manual"
                 break
-            guid = recipients[idx]
-
-            async def _send_once():
-                if use_forward:
-                    await rb.send_document_direct(client, guid, marked_path, marked_caption,
-                                                  file_name=marked_name)
-                else:
-                    await rb.send_content(client, guid, content)
-
             try:
-                await _send_once()
+                await _send_to(recipients[i])
                 success += 1
-                rate_limit_hits = 0
-                idx += 1
-            except Exception as e:  # noqa: BLE001
-                msg = str(e)
-                is_rate = "TOO_REQUESTS" in msg or "TooRequests" in type(e).__name__
-                if is_rate:
-                    # Real Rubika rate limit.
-                    rate_limit_hits += 1
-                    # If we're rate-limited from the VERY START (nothing sent yet)
-                    # the account is in cooldown -> stop fast, don't hang for hours.
-                    if success == 0 and rate_limit_hits >= 3:
-                        stopped_reason = "cooldown"
-                        await log(card("ACCOUNT COOLDOWN ⏳", [
-                            f"📱 {acc['phone']}",
-                            "روبیکا این اکانت را موقتاً محدود کرده (cooldown).",
-                            "چند ساعت دیگر دوباره امتحان کن.",
-                            f"🕒 {now()}",
-                        ]))
-                        break
-                    if rate_limit_hits > 6:
-                        stopped_reason = "error"
-                        await log(card("RATE LIMIT ⏳", [
-                            f"📱 {acc['phone']}",
-                            f"✅ Sent : {success} / {total}",
-                            f"⏸ Paused at : #{idx + 1}",
-                            "صبر طولانی هم جواب نداد؛ بعداً دوباره شروع کن.",
-                            f"🕒 {now()}",
-                        ]))
-                        break
-                    if not notified_wait:
-                        await log(card("RATE LIMIT — WAITING ⏳", [
-                            f"📱 {acc['phone']}",
-                            f"✅ Sent : {success} / {total}",
-                            f"⏸ Pause #{idx + 1} · صبر {int(config.RATE_LIMIT_WAIT)} ثانیه",
-                            f"🕒 {now()}",
-                        ]))
-                        notified_wait = True
-                    # Sleep in 1s chunks so the STOP button responds immediately.
-                    waited = 0.0
-                    while waited < config.RATE_LIMIT_WAIT:
-                        if stop_flags.get(account_id):
-                            break
-                        await asyncio.sleep(1)
-                        waited += 1
-                    # do NOT advance idx -> retry the same recipient
-                    continue
-                else:
-                    # transient glitch -> retry once, then skip
-                    await asyncio.sleep(1)
-                    try:
-                        await _send_once()
-                        success += 1
-                    except Exception:  # noqa: BLE001
-                        fail += 1
-                    idx += 1
-            # normal gap between sends, but stay responsive to STOP
-            slept = 0.0
-            while slept < per_delay:
+                probe_ok += 1
+            except Exception:  # noqa: BLE001
+                fail += 1
+            await asyncio.sleep(config.SEND_DELAY)
+
+        # If the probe didn't succeed at all -> account/file is being blocked.
+        if stopped_reason != "manual" and probe_ok == 0:
+            await log(card("TEST FAILED ⚠️", [
+                f"📱 {acc['phone']}",
+                f"✅ تست ۵ نفر اول: {probe_ok}/{probe_n}",
+                "روبیکا ارسال را قبول نکرد؛ ارسال متوقف شد.",
+                f"🕒 {now()}",
+            ]))
+            stopped_reason = "test_failed"
+
+        # ---- STEP 2: probe ok -> send to the rest ----
+        if stopped_reason is None:
+            await log(card("TEST OK ✅ — ادامه ارسال", [
+                f"📱 {acc['phone']}",
+                f"✅ تست: {probe_ok}/{probe_n}  → ارسال به بقیه",
+                f"🕒 {now()}",
+            ]))
+            for i in range(probe_n, total):
                 if stop_flags.get(account_id):
+                    stopped_reason = "manual"
                     break
-                await asyncio.sleep(min(0.5, per_delay - slept))
-                slept += 0.5
+                try:
+                    await _send_to(recipients[i])
+                    success += 1
+                except Exception:  # noqa: BLE001
+                    fail += 1
+                await asyncio.sleep(config.SEND_DELAY)
 
         duration = int((datetime.now() - started).total_seconds())
         rate = f"{(success / total * 100):.0f}%" if total else "0%"
@@ -678,8 +638,8 @@ async def do_send(account_id: int):
         title = "BROADCAST FINISHED 🏁"
         if stopped_reason == "manual":
             title = "BROADCAST STOPPED 🛑"
-        elif stopped_reason == "error":
-            title = "BROADCAST STOPPED ⏳"
+        elif stopped_reason == "test_failed":
+            title = "BROADCAST STOPPED ⚠️"
         await log(card(title, finished_rows))
     except Exception as e:  # noqa: BLE001
         await log(card("BROADCAST ERROR ❌", [
