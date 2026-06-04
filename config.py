@@ -49,6 +49,34 @@ RATE_LIMIT_WAIT = _float("RATE_LIMIT_WAIT", 45.0)
 # (no re-upload). Leave empty to use the normal "set content" flow instead.
 FORWARD_MARKER = os.getenv("FORWARD_MARKER", "").strip()
 
+# Optional proxy for the Rubika userbot connection (helps when the server IP is
+# blocked/throttled by Rubika's media servers). Format examples:
+#   PROXY=socks5://1.2.3.4:1080
+#   PROXY=socks5://user:pass@1.2.3.4:1080
+#   PROXY=http://1.2.3.4:8080
+PROXY = os.getenv("PROXY", "").strip()
+
+
+def parse_proxy(url: str):
+    """Return a (scheme, host, port[, user, pass]) tuple for rubpy/python-socks,
+    or None if no proxy is set."""
+    if not url:
+        return None
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        scheme = (u.scheme or "socks5").lower()
+        host = u.hostname
+        port = u.port
+        if not host or not port:
+            return None
+        if u.username and u.password:
+            return (scheme, host, int(port), True, u.username, u.password)
+        return (scheme, host, int(port))
+    except Exception:
+        return None
+
+
 # Everyone allowed to use the bot = the owner + any extra admins
 ALLOWED_IDS = [i for i in ([OWNER_ID] + ADMIN_IDS) if i]
 

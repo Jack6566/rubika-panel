@@ -20,6 +20,8 @@ import os
 from rubpy import Client
 from rubpy.crypto import Crypto
 
+import config
+
 SESSIONS_DIR = os.path.join(os.path.dirname(__file__), "data", "sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
@@ -29,12 +31,25 @@ def session_path(phone: str) -> str:
     return os.path.join(SESSIONS_DIR, f"acc_{safe}")
 
 
-def open_client(phone: str) -> Client:
-    """Return a rubpy client bound to the account's SAVED session.
+def _make_client(name: str) -> Client:
+    """Create a rubpy Client, attaching a proxy if PROXY is configured.
 
-    For an already-authorized session, connect() loads it without prompting.
+    rubpy accepts a `proxy` kwarg as a python-socks tuple. We try with proxy
+    first and silently fall back to no-proxy if this rubpy build doesn't accept
+    that kwarg, so nothing breaks when PROXY is empty.
     """
-    return Client(name=session_path(phone))
+    proxy = config.parse_proxy(config.PROXY)
+    if proxy:
+        try:
+            return Client(name=name, proxy=proxy)
+        except TypeError:
+            pass  # this rubpy build doesn't take a proxy kwarg
+    return Client(name=name)
+
+
+def open_client(phone: str) -> Client:
+    """Return a rubpy client bound to the account's SAVED session."""
+    return _make_client(session_path(phone))
 
 
 async def connect_ready(client: Client):
@@ -109,7 +124,7 @@ async def start_login(phone: str, pass_key: str = None):
       {client, phone, status, phone_code_hash, hint, public_key, private_key}
     """
     phone = normalize_phone(phone)
-    client = ctx_client = Client(name=session_path(phone))
+    client = ctx_client = _make_client(session_path(phone))
     await client.connect()
 
     public_key, private_key = Crypto.create_keys()
