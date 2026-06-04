@@ -569,15 +569,22 @@ async def do_send(account_id: int):
         success = 0
         fail = 0
         stopped_reason = None
+        error_detail = ""
         started = datetime.now()
 
-        # Per-send timeout so a stuck upload (e.g. 502 from Rubika media server)
-        # can NEVER hang the whole broadcast. If one recipient takes too long,
-        # we skip it and continue. This is why the finish log never appeared.
-        SEND_TIMEOUT = 60
+        # Resume support: skip recipients already sent to in a previous run.
+        already = db.get_sent_guids(account_id)
+        sent_set = set(already)
+        if already:
+            await log(card("RESUME ▶️", [
+                f"📱 {acc['phone']}",
+                f"قبلاً ارسال‌شده: {len(already)} — ادامه از همان‌جا",
+                f"🕒 {now()}",
+            ]))
 
-        async def _send_guarded(guid):
-            return await asyncio.wait_for(_send_to_guid(guid), timeout=SEND_TIMEOUT)
+        # Per-send timeout so a stuck upload (e.g. 502 from Rubika media server)
+        # can NEVER hang the whole broadcast.
+        SEND_TIMEOUT = 60
 
         async def _send_to_guid(guid):
             if use_forward:
@@ -586,27 +593,32 @@ async def do_send(account_id: int):
             else:
                 await rb.send_content(client, guid, content)
 
-        # ---- STEP 1: probe the first 5 recipients ----
-        probe_n = min(5, total)
+        async def _send_guarded(guid):
+            return await asyncio.wait_for(_send_to_guid(guid), timeout=SEND_TIMEOUT)
+
+        # ---- STEP 1: probe the first 5 NEW recipients ----
+        probe_targets = [g for g in recipients if g not in sent_set][:5]
         probe_ok = 0
-        for i in range(probe_n):
+        for guid in probe_targets:
             if stop_flags.get(account_id):
                 stopped_reason = "manual"
                 break
             try:
-                await _send_guarded(recipients[i])
+                await _send_guarded(guid)
                 success += 1
                 probe_ok += 1
-            except Exception:  # noqa: BLE001  (timeout or send error)
+                sent_set.add(guid)
+            except Exception as e:  # noqa: BLE001
                 fail += 1
-            await asyncio.sleep(config.SEND_DELAY)
+                error_detail = repr(e)[:120]
+        db.save_sent_guids(account_id, sent_set)
 
         # If the probe didn't succeed at all -> account/file is being blocked.
         if stopped_reason != "manual" and probe_ok == 0:
             await log(card("TEST FAILED ⚠️", [
                 f"📱 {acc['phone']}",
-                f"✅ تست ۵ نفر اول: {probe_ok}/{probe_n}",
-                "روبیکا ارسال را قبول نکرد؛ ارسال متوقف شد.",
+                f"✅ تست ۵ نفر اول: {probe_ok}/{len(probe_targets)}",
+                f"💥 {error_detail or 'روبیکا ارسال را قبول نکرد'}",
                 f"🕒 {now()}",
             ]))
             stopped_reason = "test_failed"
@@ -615,19 +627,38 @@ async def do_send(account_id: int):
         if stopped_reason is None:
             await log(card("TEST OK ✅ — ادامه ارسال", [
                 f"📱 {acc['phone']}",
-                f"✅ تست: {probe_ok}/{probe_n}  → ارسال به بقیه",
+                f"✅ تست: {probe_ok}/{len(probe_targets)}  → ارسال به بقیه",
                 f"🕒 {now()}",
             ]))
-            for i in range(probe_n, total):
+            rest = [g for g in recipients if g not in sent_set]
+            since_save = 0
+            for guid in rest:
                 if stop_flags.get(account_id):
                     stopped_reason = "manual"
                     break
                 try:
-                    await _send_guarded(recipients[i])
+                    await _send_guarded(guid)
                     success += 1
-                except Exception:  # noqa: BLE001  (timeout or send error -> skip)
+                    sent_set.add(guid)
+                except Exception as e:  # noqa: BLE001
                     fail += 1
+                    error_detail = repr(e)[:120]
+                since_save += 1
+                # summary progress log every 20, and save progress for resume
+                if since_save >= 20:
+                    db.save_sent_guids(account_id, sent_set)
+                    await log(card("PROGRESS 📤", [
+                        f"📱 {acc['phone']}",
+                        f"✅ {success}   ❌ {fail}   🎯 {total}",
+                        f"🕒 {now()}",
+                    ]))
+                    since_save = 0
                 await asyncio.sleep(config.SEND_DELAY)
+            db.save_sent_guids(account_id, sent_set)
+
+        # broadcast finished or stopped -> clear progress if fully done
+        if stopped_reason is None:
+            db.clear_progress(account_id)
 
         duration = int((datetime.now() - started).total_seconds())
         rate = f"{(success / total * 100):.0f}%" if total else "0%"
@@ -639,6 +670,8 @@ async def do_send(account_id: int):
             f"📊 Success rate : {rate}",
             f"⏱ Duration : {duration}s",
         ]
+        if stopped_reason and error_detail:
+            finished_rows.append(f"💥 آخرین خطا: {error_detail}")
         if n_no_target:
             finished_rows.append(f"⚠️ No target : {n_no_target}")
         finished_rows.append(f"🕒 {now()}")
@@ -650,9 +683,16 @@ async def do_send(account_id: int):
             title = "BROADCAST STOPPED ⚠️"
         await log(card(title, finished_rows))
     except Exception as e:  # noqa: BLE001
+        # Always report, even on an unexpected crash, with how far we got.
+        try:
+            db.save_sent_guids(account_id, sent_set)
+        except Exception:  # noqa: BLE001
+            pass
         await log(card("BROADCAST ERROR ❌", [
             f"📱 Phone : {acc['phone']}",
-            f"💥 Error : {e}",
+            f"✅ ارسال‌شده تا اینجا: {success} / {total}",
+            f"💥 Error : {repr(e)[:150]}",
+            f"🕒 {now()}",
         ]))
     finally:
         stop_flags.pop(account_id, None)

@@ -46,6 +46,51 @@ def init():
         "INSERT OR IGNORE INTO settings (id, content_type, content_text, media_path) "
         "VALUES (1, NULL, NULL, NULL)"
     )
+    # Per-account broadcast progress, so a stopped/crashed run can resume from
+    # where it left off (stores the guids already sent to).
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS progress (
+            account_id INTEGER PRIMARY KEY,
+            sent_guids TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------- broadcast progress (resume) ----------
+
+def get_sent_guids(account_id: int) -> set:
+    conn = _conn()
+    row = conn.execute("SELECT sent_guids FROM progress WHERE account_id = ?",
+                       (account_id,)).fetchone()
+    conn.close()
+    if row and row["sent_guids"]:
+        return set(row["sent_guids"].split(","))
+    return set()
+
+
+def save_sent_guids(account_id: int, guids: set):
+    conn = _conn()
+    conn.execute(
+        """
+        INSERT INTO progress (account_id, sent_guids, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(account_id) DO UPDATE SET
+            sent_guids=excluded.sent_guids, updated_at=excluded.updated_at
+        """,
+        (account_id, ",".join(guids), datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_progress(account_id: int):
+    conn = _conn()
+    conn.execute("DELETE FROM progress WHERE account_id = ?", (account_id,))
     conn.commit()
     conn.close()
 
