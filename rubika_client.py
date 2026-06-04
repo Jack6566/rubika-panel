@@ -31,14 +31,14 @@ def session_path(phone: str) -> str:
     return os.path.join(SESSIONS_DIR, f"acc_{safe}")
 
 
-def _make_client(name: str) -> Client:
-    """Create a rubpy Client, attaching a proxy if PROXY is configured.
+def _make_client(name: str, proxy_str: str = None) -> Client:
+    """Create a rubpy Client. rubpy 7.x wants the proxy as a STRING
+    ('socks5://user:pass@host:port'), NOT a tuple. Passing a tuple raised
+    'Constructor parameter should be str'.
 
-    rubpy accepts a `proxy` kwarg as a python-socks tuple. We try with proxy
-    first and silently fall back to no-proxy if this rubpy build doesn't accept
-    that kwarg, so nothing breaks when PROXY is empty.
+    Order: explicit proxy_str -> global config.PROXY -> no proxy.
     """
-    proxy = config.parse_proxy(config.PROXY)
+    proxy = proxy_str or (config.PROXY or None)
     if proxy:
         try:
             return Client(name=name, proxy=proxy)
@@ -47,24 +47,13 @@ def _make_client(name: str) -> Client:
     return Client(name=name)
 
 
-def _make_client_with(name: str, proxy_tuple=None) -> Client:
-    """Create a client using an EXPLICIT proxy tuple (from proxy_manager),
-    falling back to the global PROXY, then to no proxy."""
-    if proxy_tuple:
-        try:
-            return Client(name=name, proxy=proxy_tuple)
-        except TypeError:
-            pass
-    return _make_client(name)
-
-
-def open_client(phone: str, proxy_tuple=None) -> Client:
+def open_client(phone: str, proxy_str: str = None) -> Client:
     """Return a rubpy client bound to the account's SAVED session.
 
-    If proxy_tuple is given, the connection (login, upload, send) goes through
-    that proxy — used to route Rubika traffic via an Iranian server.
+    If proxy_str is given (e.g. 'socks5://user:pass@host:port'), all Rubika
+    traffic (login, upload, send) is routed through that proxy.
     """
-    return _make_client_with(session_path(phone), proxy_tuple)
+    return _make_client(session_path(phone), proxy_str)
 
 
 async def connect_ready(client: Client):

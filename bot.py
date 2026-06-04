@@ -730,10 +730,10 @@ async def do_send(account_id: int):
     # Pick a healthy proxy (round-robin) to route Rubika traffic through an
     # Iranian server. If none configured/healthy, connect directly.
     chosen_proxy = pm.next_healthy_proxy()
-    proxy_tpl = pm.proxy_tuple(chosen_proxy) if chosen_proxy else None
+    proxy_str = pm.proxy_url(chosen_proxy) if chosen_proxy else None
     proxy_label = chosen_proxy["host"] if chosen_proxy else "بدون پروکسی (مستقیم)"
 
-    client = rb.open_client(acc["phone"], proxy_tuple=proxy_tpl)
+    client = rb.open_client(acc["phone"], proxy_str=proxy_str)
     try:
         # connect_ready rebuilds the signing keys (fixes 'NoneType has no sign')
         await rb.connect_ready(client)
