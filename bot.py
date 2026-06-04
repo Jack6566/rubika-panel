@@ -570,28 +570,44 @@ async def do_send(account_id: int):
         success = 0
         fail = 0
         stopped_reason = None
+        consecutive_fails = 0   # only a long streak means a real rate limit
+        MAX_STREAK = 10
         started = datetime.now()
         for idx, guid in enumerate(recipients, start=1):
             if stop_flags.get(account_id):
                 stopped_reason = "manual"
                 break
-            try:
+
+            async def _send_once():
                 if use_forward:
                     await rb.forward_message(client, fwd_from, guid, fwd_msg_id)
                 else:
                     await rb.send_content(client, guid, content)
+
+            try:
+                await _send_once()
                 success += 1
-            except Exception:  # noqa: BLE001
-                fail += 1
-                stopped_reason = "error"
-                # Clean, short rate-limit / failure log (left-aligned)
-                await log(card("RATE LIMIT ⏳", [
-                    f"📱 {acc['phone']}",
-                    f"✅ Sent : {success} / {total}",
-                    f"⏸ Stopped at : #{idx}",
-                    f"🕒 {now()}",
-                ]))
-                break  # STOP IMMEDIATELY on first failure
+                consecutive_fails = 0
+            except Exception:  # noqa: BLE001  (transient glitch -> retry once)
+                await asyncio.sleep(2)
+                try:
+                    await _send_once()
+                    success += 1
+                    consecutive_fails = 0
+                except Exception:  # noqa: BLE001  (still failing -> skip, keep going)
+                    fail += 1
+                    consecutive_fails += 1
+                    if consecutive_fails >= MAX_STREAK:
+                        # A long failure streak = a real rate limit. Stop cleanly.
+                        stopped_reason = "error"
+                        await log(card("RATE LIMIT ⏳", [
+                            f"📱 {acc['phone']}",
+                            f"✅ Sent : {success} / {total}",
+                            f"⏸ Stopped at : #{idx}",
+                            f"🕒 {now()}",
+                        ]))
+                        break
+                    # otherwise just skip this recipient and continue
             await asyncio.sleep(config.SEND_DELAY)
 
         duration = int((datetime.now() - started).total_seconds())
