@@ -509,6 +509,14 @@ async def do_send(account_id: int):
         await log("⚠️ Broadcast cancelled: no content configured.")
         return
 
+    # initialise everything the except/finally blocks may touch, so an early
+    # error (e.g. in connect_ready) can't cause a second NameError crash.
+    success = 0
+    fail = 0
+    total = 0
+    sent_set = set()
+    error_detail = ""
+
     client = rb.open_client(acc["phone"])
     try:
         # connect_ready rebuilds the signing keys (fixes 'NoneType has no sign')
@@ -574,15 +582,12 @@ async def do_send(account_id: int):
             f"🎯 Targets : {total}",
         ]))
 
-        success = 0
-        fail = 0
-        stopped_reason = None
-        error_detail = ""
         started = datetime.now()
 
         # Resume support: skip recipients already sent to in a previous run.
         already = db.get_sent_guids(account_id)
         sent_set = set(already)
+        stopped_reason = None
         if already:
             await log(card("RESUME ▶️", [
                 f"📱 {acc['phone']}",
