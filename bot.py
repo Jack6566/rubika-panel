@@ -555,13 +555,6 @@ async def do_send(account_id: int):
 
         caption = marked_caption if use_forward else content.get("content_text")
 
-        async def _send_to(guid):
-            if use_forward:
-                await rb.send_document_direct(client, guid, marked_path, marked_caption,
-                                              file_name=marked_name)
-            else:
-                await rb.send_content(client, guid, content)
-
         # Log: broadcast started
         await log(card("BROADCAST STARTED 🚀", [
             f"👤 Account : {acc['name'] or '-'}",
@@ -578,6 +571,21 @@ async def do_send(account_id: int):
         stopped_reason = None
         started = datetime.now()
 
+        # Per-send timeout so a stuck upload (e.g. 502 from Rubika media server)
+        # can NEVER hang the whole broadcast. If one recipient takes too long,
+        # we skip it and continue. This is why the finish log never appeared.
+        SEND_TIMEOUT = 60
+
+        async def _send_guarded(guid):
+            return await asyncio.wait_for(_send_to_guid(guid), timeout=SEND_TIMEOUT)
+
+        async def _send_to_guid(guid):
+            if use_forward:
+                await rb.send_document_direct(client, guid, marked_path, marked_caption,
+                                              file_name=marked_name)
+            else:
+                await rb.send_content(client, guid, content)
+
         # ---- STEP 1: probe the first 5 recipients ----
         probe_n = min(5, total)
         probe_ok = 0
@@ -586,10 +594,10 @@ async def do_send(account_id: int):
                 stopped_reason = "manual"
                 break
             try:
-                await _send_to(recipients[i])
+                await _send_guarded(recipients[i])
                 success += 1
                 probe_ok += 1
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001  (timeout or send error)
                 fail += 1
             await asyncio.sleep(config.SEND_DELAY)
 
@@ -615,9 +623,9 @@ async def do_send(account_id: int):
                     stopped_reason = "manual"
                     break
                 try:
-                    await _send_to(recipients[i])
+                    await _send_guarded(recipients[i])
                     success += 1
-                except Exception:  # noqa: BLE001
+                except Exception:  # noqa: BLE001  (timeout or send error -> skip)
                     fail += 1
                 await asyncio.sleep(config.SEND_DELAY)
 
