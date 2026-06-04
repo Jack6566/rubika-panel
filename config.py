@@ -39,6 +39,11 @@ OWNER_ID = _int("OWNER_ID")
 ADMIN_IDS = _id_list("ADMIN_IDS")
 LOG_GROUP_ID = _int("LOG_GROUP_ID")
 SEND_DELAY = _float("SEND_DELAY", 0.5)
+# Forwarding is rate-limited by Rubika much harder than normal sends, so it
+# needs a bigger gap. Used when FORWARD_MARKER is set.
+FORWARD_DELAY = _float("FORWARD_DELAY", 4.0)
+# How long to wait when Rubika replies TOO_REQUESTS, before resuming.
+RATE_LIMIT_WAIT = _float("RATE_LIMIT_WAIT", 45.0)
 # Marker placed at the END of a file's caption in your Rubika Saved Messages.
 # When set, the bot finds that marked message and FORWARDS it to everyone
 # (no re-upload). Leave empty to use the normal "set content" flow instead.

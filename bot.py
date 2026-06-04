@@ -570,13 +570,17 @@ async def do_send(account_id: int):
         success = 0
         fail = 0
         stopped_reason = None
-        consecutive_fails = 0   # only a long streak means a real rate limit
-        MAX_STREAK = 10
+        # delay depends on mode: forwarding is rate-limited much harder
+        per_delay = config.FORWARD_DELAY if use_forward else config.SEND_DELAY
+        rate_limit_hits = 0
+        notified_wait = False
         started = datetime.now()
-        for idx, guid in enumerate(recipients, start=1):
+        idx = 0
+        while idx < len(recipients):
             if stop_flags.get(account_id):
                 stopped_reason = "manual"
                 break
+            guid = recipients[idx]
 
             async def _send_once():
                 if use_forward:
@@ -587,28 +591,46 @@ async def do_send(account_id: int):
             try:
                 await _send_once()
                 success += 1
-                consecutive_fails = 0
-            except Exception:  # noqa: BLE001  (transient glitch -> retry once)
-                await asyncio.sleep(2)
-                try:
-                    await _send_once()
-                    success += 1
-                    consecutive_fails = 0
-                except Exception:  # noqa: BLE001  (still failing -> skip, keep going)
-                    fail += 1
-                    consecutive_fails += 1
-                    if consecutive_fails >= MAX_STREAK:
-                        # A long failure streak = a real rate limit. Stop cleanly.
+                rate_limit_hits = 0
+                idx += 1
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+                is_rate = "TOO_REQUESTS" in msg or "TooRequests" in type(e).__name__
+                if is_rate:
+                    # Real Rubika rate limit -> wait long, then RETRY same target
+                    rate_limit_hits += 1
+                    if rate_limit_hits > 6:
+                        # repeatedly limited even after waiting -> stop cleanly
                         stopped_reason = "error"
                         await log(card("RATE LIMIT ⏳", [
                             f"📱 {acc['phone']}",
                             f"✅ Sent : {success} / {total}",
-                            f"⏸ Stopped at : #{idx}",
+                            f"⏸ Paused at : #{idx + 1}",
+                            "صبر طولانی هم جواب نداد؛ بعداً دوباره شروع کن.",
                             f"🕒 {now()}",
                         ]))
                         break
-                    # otherwise just skip this recipient and continue
-            await asyncio.sleep(config.SEND_DELAY)
+                    if not notified_wait:
+                        await log(card("RATE LIMIT — WAITING ⏳", [
+                            f"📱 {acc['phone']}",
+                            f"✅ Sent : {success} / {total}",
+                            f"⏸ Pause #{idx + 1} · صبر {int(config.RATE_LIMIT_WAIT)} ثانیه",
+                            f"🕒 {now()}",
+                        ]))
+                        notified_wait = True
+                    await asyncio.sleep(config.RATE_LIMIT_WAIT)
+                    # do NOT advance idx -> retry the same recipient
+                    continue
+                else:
+                    # transient glitch -> retry once, then skip
+                    await asyncio.sleep(2)
+                    try:
+                        await _send_once()
+                        success += 1
+                    except Exception:  # noqa: BLE001
+                        fail += 1
+                    idx += 1
+            await asyncio.sleep(per_delay)
 
         duration = int((datetime.now() - started).total_seconds())
         rate = f"{(success / total * 100):.0f}%" if total else "0%"
