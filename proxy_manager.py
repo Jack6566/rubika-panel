@@ -84,12 +84,17 @@ def setup_proxy(proxy_id: int) -> tuple:
         if "NO" in out:
             return False, "Docker install failed on server"
 
-        # 2) remove any old container with same name, then run a fresh one
+        # 2) remove any old container with same name, then run a fresh one.
+        # IMPORTANT: use --network host. On many servers the default Docker
+        # bridge network has NO outbound internet for containers (proven: even
+        # `docker run curlimages/curl google.com` returned 000). With host
+        # networking the container uses the server's own network (which works),
+        # and the proxy listens directly on the server's port.
         name = f"rubikaproxy_{port}"
         _run(client, f"docker rm -f {name} 2>/dev/null || true")
         run_cmd = (
             f"docker run -d --restart=always --name {name} "
-            f"-p {port}:1080 "
+            f"--network host "
             f"-e PROXY_USER={puser} -e PROXY_PASSWORD={ppass} "
             f"serjs/go-socks5-proxy"
         )
@@ -97,7 +102,7 @@ def setup_proxy(proxy_id: int) -> tuple:
         if code != 0:
             return False, f"docker run failed: {(err or out)[:120]}"
 
-        return True, f"proxy container running on :{port}"
+        return True, f"proxy container running on :{port} (host network)"
     finally:
         try:
             client.close()
