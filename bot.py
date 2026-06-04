@@ -513,9 +513,10 @@ async def do_send(account_id: int):
         # the way forwards are).
         marked_path = None
         marked_caption = ""
+        marked_name = None
         if use_forward:
             try:
-                marked_path, marked_caption, _msg = await rb.download_marked_file(
+                marked_path, marked_caption, marked_name = await rb.download_marked_file(
                     client, config.FORWARD_MARKER
                 )
             except Exception as e:  # noqa: BLE001
@@ -589,7 +590,8 @@ async def do_send(account_id: int):
 
             async def _send_once():
                 if use_forward:
-                    await rb.send_document_direct(client, guid, marked_path, marked_caption)
+                    await rb.send_document_direct(client, guid, marked_path, marked_caption,
+                                                  file_name=marked_name)
                 else:
                     await rb.send_content(client, guid, content)
 

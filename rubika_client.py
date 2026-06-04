@@ -481,29 +481,73 @@ async def find_marked_message(client: Client, marker: str):
     return saved_guid, None, None
 
 
+def _file_name_of(msg):
+    """Extract the original file name (e.g. 'v.p.n.zip') from a message."""
+    d = _data_of(msg)
+    if isinstance(d.get("file_inline"), dict) and d["file_inline"].get("file_name"):
+        return d["file_inline"]["file_name"]
+    if d.get("file_name"):
+        return d["file_name"]
+    fi = getattr(msg, "file_inline", None)
+    if fi is not None:
+        fn = getattr(fi, "file_name", None) or (fi.get("file_name") if isinstance(fi, dict) else None)
+        if fn:
+            return fn
+    return "file.bin"
+
+
 async def download_marked_file(client: Client, marker: str):
-    """Find the marked message in Saved Messages, download its file ONCE, and
-    return (file_path, caption_without_marker, message_obj). The caption has the
-    marker stripped so it isn't shown to recipients.
+    """Find the marked message in Saved Messages, download its bytes ONCE,
+    save them to disk with the ORIGINAL file name, and return
+    (file_path, caption_without_marker, file_name).
+
+    rubpy's download() returns BYTES, and send_document needs a real path with
+    the proper name (otherwise: 'file_name must be specified when uploading
+    from bytes'). So we persist the bytes with the original name first.
     """
     saved_guid, mid, msg = await find_marked_message(client, marker)
     if not mid or msg is None:
         return None, None, None
     caption = _msg_text_of(msg).replace(marker, "").strip()
-    path = None
+    file_name = _file_name_of(msg)
+
+    data = None
     try:
-        path = await client.download(msg)
+        data = await client.download(msg)
     except Exception:
-        # some versions: download by message id
         try:
-            path = await client.download(saved_guid, mid)
+            data = await client.download(saved_guid, mid)
         except Exception:
-            path = None
-    return path, caption, msg
+            data = None
+    if data is None:
+        return None, caption, file_name
+
+    # If rubpy already returned a path (str), just use it.
+    if isinstance(data, str) and os.path.exists(data):
+        return data, caption, file_name
+
+    # Otherwise it's bytes -> write to disk with the original name.
+    media_dir = os.path.join(os.path.dirname(__file__), "data", "media")
+    os.makedirs(media_dir, exist_ok=True)
+    path = os.path.join(media_dir, file_name)
+    try:
+        with open(path, "wb") as f:
+            f.write(data if isinstance(data, (bytes, bytearray)) else bytes(data))
+    except Exception:
+        return None, caption, file_name
+    return path, caption, file_name
 
 
-async def send_document_direct(client: Client, guid: str, file_path: str, caption: str = ""):
+async def send_document_direct(client: Client, guid: str, file_path: str, caption: str = "",
+                               file_name: str = None):
     """Send a document/file DIRECTLY to one recipient (not a forward)."""
+    if file_name:
+        try:
+            await client.send_document(guid, file_path, caption=caption or "",
+                                       file_name=file_name)
+            return
+        except TypeError:
+            pass  # this rubpy version doesn't accept file_name kwarg
     await client.send_document(guid, file_path, caption=caption or "")
 
 
