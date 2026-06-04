@@ -1,7 +1,10 @@
 rubpy
 telethon==1.36.0
 python-dotenv==1.0.1
-# For SOCKS/HTTP proxy support (PROXY in .env):
+# For SOCKS/HTTP proxy support (PROXY in .env and proxy_manager):
 python-socks[asyncio]
+requests[socks]
+# For SSH into proxy servers (auto Docker install):
+paramiko
 # Optional but recommended for faster encryption (uncomment if you can install it):
 # cryptg==0.4.0

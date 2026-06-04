@@ -47,9 +47,24 @@ def _make_client(name: str) -> Client:
     return Client(name=name)
 
 
-def open_client(phone: str) -> Client:
-    """Return a rubpy client bound to the account's SAVED session."""
-    return _make_client(session_path(phone))
+def _make_client_with(name: str, proxy_tuple=None) -> Client:
+    """Create a client using an EXPLICIT proxy tuple (from proxy_manager),
+    falling back to the global PROXY, then to no proxy."""
+    if proxy_tuple:
+        try:
+            return Client(name=name, proxy=proxy_tuple)
+        except TypeError:
+            pass
+    return _make_client(name)
+
+
+def open_client(phone: str, proxy_tuple=None) -> Client:
+    """Return a rubpy client bound to the account's SAVED session.
+
+    If proxy_tuple is given, the connection (login, upload, send) goes through
+    that proxy — used to route Rubika traffic via an Iranian server.
+    """
+    return _make_client_with(session_path(phone), proxy_tuple)
 
 
 async def connect_ready(client: Client):

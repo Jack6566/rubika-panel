@@ -46,6 +46,27 @@ def init():
         "INSERT OR IGNORE INTO settings (id, content_type, content_text, media_path) "
         "VALUES (1, NULL, NULL, NULL)"
     )
+    # Proxy servers (SSH details + last health-check result). The bot SSHes in,
+    # installs a Docker SOCKS5 proxy, then routes Rubika traffic through them.
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS proxies (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            host        TEXT,
+            ssh_port    INTEGER DEFAULT 22,
+            ssh_user    TEXT,
+            ssh_pass    TEXT,
+            proxy_port  INTEGER DEFAULT 1080,
+            proxy_user  TEXT,
+            proxy_pass  TEXT,
+            status      TEXT DEFAULT 'unknown',
+            ping_ms     INTEGER DEFAULT 0,
+            upload_ok   INTEGER DEFAULT 0,
+            added_at    TEXT,
+            checked_at  TEXT
+        )
+        """
+    )
     # Per-account broadcast progress, so a stopped/crashed run can resume from
     # where it left off (stores the guids already sent to).
     c.execute(
@@ -163,3 +184,67 @@ def get_content() -> dict:
     row = conn.execute("SELECT * FROM settings WHERE id = 1").fetchone()
     conn.close()
     return dict(row) if row else {"content_type": None, "content_text": None, "media_path": None}
+
+
+
+# --------------------------------------------------------------------------- #
+# Proxy management
+# --------------------------------------------------------------------------- #
+def add_proxy(host, ssh_port, ssh_user, ssh_pass, proxy_port, proxy_user, proxy_pass) -> int:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO proxies (host, ssh_port, ssh_user, ssh_pass, proxy_port,
+                             proxy_user, proxy_pass, status, added_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'unknown', ?)
+        """,
+        (host, ssh_port, ssh_user, ssh_pass, proxy_port, proxy_user, proxy_pass,
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    conn.commit()
+    pid = c.lastrowid
+    conn.close()
+    return pid
+
+
+def list_proxies() -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM proxies ORDER BY id").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_proxy(proxy_id: int):
+    conn = _conn()
+    row = conn.execute("SELECT * FROM proxies WHERE id = ?", (proxy_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def delete_proxy(proxy_id: int):
+    conn = _conn()
+    conn.execute("DELETE FROM proxies WHERE id = ?", (proxy_id,))
+    conn.commit()
+    conn.close()
+
+
+def update_proxy_health(proxy_id: int, status: str, ping_ms: int, upload_ok: bool):
+    conn = _conn()
+    conn.execute(
+        "UPDATE proxies SET status = ?, ping_ms = ?, upload_ok = ?, checked_at = ? WHERE id = ?",
+        (status, ping_ms, 1 if upload_ok else 0,
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S"), proxy_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def healthy_proxies() -> list:
+    """Proxies that passed the upload test, ordered by ping (fastest first)."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM proxies WHERE upload_ok = 1 AND status != 'red' ORDER BY ping_ms"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]

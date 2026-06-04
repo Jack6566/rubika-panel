@@ -24,6 +24,7 @@ from telethon import TelegramClient, events, Button
 import config
 import db
 import rubika_client as rb
+import proxy_manager as pm
 
 MEDIA_DIR = os.path.join(os.path.dirname(__file__), "data", "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
@@ -75,9 +76,14 @@ def main_menu():
     return [
         [Button.inline("➕ افزودن اکانت", b"add_account"),
          Button.inline("👥 اکانت‌ها", b"manage_accounts")],
-        [Button.inline("⚙️ تنظیم محتوا", b"set_content")],
+        [Button.inline("⚙️ تنظیم محتوا", b"set_content"),
+         Button.inline("🔌 پروکسی‌ها", b"proxies")],
         [Button.inline("💾 بکاپ", b"backup")],
     ]
+
+
+def proxy_status_emoji(p):
+    return {"green": "🟢", "yellow": "🟡", "red": "🔴"}.get(p.get("status"), "⚪")
 
 
 WELCOME = (
@@ -306,6 +312,158 @@ async def stop_cb(event):
 
 
 # --------------------------------------------------------------------------- #
+# Proxies (SSH servers turned into SOCKS5 via Docker)
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"proxies"))
+async def proxies_cb(event):
+    if not is_owner(event):
+        return
+    items = db.list_proxies()
+    rows = []
+    for p in items:
+        emoji = proxy_status_emoji(p)
+        up = "آپلود ✅" if p.get("upload_ok") else "آپلود ❌"
+        ping = f"{p.get('ping_ms', 0)}ms"
+        rows.append([Button.inline(f"{emoji} {p['host']} — {ping} — {up}",
+                                   f"px_{p['id']}".encode())])
+    rows.append([Button.inline("➕ افزودن سرور پروکسی", b"px_add")])
+    rows.append([Button.inline("🔄 چک سلامت همه", b"px_check")])
+    rows.append([Button.inline("🔙 بازگشت", b"home")])
+    head = "🔌 سرورهای پروکسی\n" + LINE + (f"\nتعداد: {len(items)}" if items else "\nهنوز سروری اضافه نشده.")
+    await event.edit(head, buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"px_add"))
+async def px_add_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_proxy"}
+    await event.edit(
+        "➕ افزودن سرور پروکسی\n" + LINE + "\n"
+        "اطلاعات SSH سرور (خام) را در یک خط بفرست، با این قالب:\n\n"
+        "`host:port:user:pass`\n\n"
+        "مثال: `1.2.3.4:22:root:mypassword`\n"
+        "(پورت پروکسی پیش‌فرض 1080 است؛ ربات خودش Docker و پروکسی را نصب می‌کند.)",
+        buttons=[[Button.inline("🔙 لغو", b"proxies")]],
+    )
+
+
+@bot.on(events.CallbackQuery(data=b"px_check"))
+async def px_check_cb(event):
+    if not is_owner(event):
+        return
+    items = db.list_proxies()
+    if not items:
+        await event.answer("سروری برای چک نیست.", alert=True)
+        return
+    await event.answer("در حال چک سلامت همه پروکسی‌ها ...")
+    await run_health_check()
+    await proxies_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=b"px_(\\d+)"))
+async def px_detail_cb(event):
+    if not is_owner(event):
+        return
+    pid = int(event.pattern_match.group(1))
+    p = db.get_proxy(pid)
+    if not p:
+        await event.answer("یافت نشد.", alert=True)
+        return
+    emoji = proxy_status_emoji(p)
+    text = (
+        "🔌 سرور پروکسی\n" + LINE + "\n"
+        f"آی‌پی    : {p['host']}\n"
+        f"پورت پروکسی: {p['proxy_port']}\n"
+        f"وضعیت    : {emoji} {p.get('status')}\n"
+        f"پینگ     : {p.get('ping_ms',0)}ms\n"
+        f"آپلود    : {'✅' if p.get('upload_ok') else '❌'}\n"
+        f"آخرین چک : {p.get('checked_at') or '-'}"
+    )
+    await event.edit(text, buttons=[
+        [Button.inline("🔧 نصب/نصب مجدد پروکسی", f"pxsetup_{pid}".encode())],
+        [Button.inline("🧪 تست این سرور", f"pxtest_{pid}".encode())],
+        [Button.inline("🗑 حذف", f"pxdel_{pid}".encode())],
+        [Button.inline("🔙 بازگشت", b"proxies")],
+    ])
+
+
+@bot.on(events.CallbackQuery(pattern=b"pxsetup_(\\d+)"))
+async def px_setup_cb(event):
+    if not is_owner(event):
+        return
+    pid = int(event.pattern_match.group(1))
+    await event.edit("🔧 در حال نصب Docker و پروکسی روی سرور ... (ممکن است چند دقیقه طول بکشد)")
+    ok, msg = await asyncio.to_thread(pm.setup_proxy, pid)
+    p = db.get_proxy(pid)
+    if ok:
+        # after install, test it right away
+        ping_ms, upload_ok, status = await asyncio.to_thread(pm.test_proxy, p)
+        db.update_proxy_health(pid, status, ping_ms, upload_ok)
+        await log(card("PROXY ADDED 🔌", [
+            f"🖥 {p['host']}",
+            f"وضعیت: {proxy_status_emoji(db.get_proxy(pid))} {status} — {ping_ms}ms",
+            f"آپلود: {'✅' if upload_ok else '❌'}",
+            f"🕒 {now()}",
+        ]))
+        await event.edit(f"✅ نصب شد: {msg}\nوضعیت: {status} — {ping_ms}ms — آپلود {'✅' if upload_ok else '❌'}",
+                         buttons=[[Button.inline("🔙 بازگشت", b"proxies")]])
+    else:
+        await event.edit(f"❌ نصب ناموفق: {msg}",
+                         buttons=[[Button.inline("🔙 بازگشت", f"px_{pid}".encode())]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"pxtest_(\\d+)"))
+async def px_test_cb(event):
+    if not is_owner(event):
+        return
+    pid = int(event.pattern_match.group(1))
+    p = db.get_proxy(pid)
+    if not p:
+        await event.answer("یافت نشد.", alert=True)
+        return
+    await event.answer("در حال تست ...")
+    ping_ms, upload_ok, status = await asyncio.to_thread(pm.test_proxy, p)
+    db.update_proxy_health(pid, status, ping_ms, upload_ok)
+    await px_detail_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=b"pxdel_(\\d+)"))
+async def px_del_cb(event):
+    if not is_owner(event):
+        return
+    pid = int(event.pattern_match.group(1))
+    db.delete_proxy(pid)
+    await event.edit("سرور پروکسی حذف شد. ✅",
+                     buttons=[[Button.inline("🔙 بازگشت", b"proxies")]])
+
+
+async def run_health_check():
+    """Test all proxies and post a status card to the log group."""
+    results = await asyncio.to_thread(pm.health_check_all)
+    if not results:
+        return
+    rows = []
+    for p in results:
+        emoji = proxy_status_emoji(p)
+        up = "✅" if p.get("upload_ok") else "❌"
+        rows.append(f"{emoji} {p['host']} — {p.get('ping_ms',0)}ms — آپلود {up}")
+    rows.append(f"🕒 {now()}")
+    await log(card("🔌 وضعیت پروکسی‌ها", rows))
+
+
+async def health_check_loop():
+    """Background task: health-check every 30 minutes."""
+    while True:
+        await asyncio.sleep(1800)  # 30 min
+        try:
+            if db.list_proxies():
+                await run_health_check()
+        except Exception as e:  # noqa: BLE001
+            print(f"[health_check_loop] {e}")
+
+
+# --------------------------------------------------------------------------- #
 # Backup
 # --------------------------------------------------------------------------- #
 @bot.on(events.CallbackQuery(data=b"backup"))
@@ -342,6 +500,58 @@ async def message_router(event):
         await handle_password(event)
     elif step == "await_content":
         await handle_content(event)
+    elif step == "await_proxy":
+        await handle_proxy(event)
+
+
+async def handle_proxy(event):
+    """Parse 'host:port:user:pass' and add a proxy server, then install it."""
+    state.pop(event.sender_id, None)
+    raw = event.raw_text.strip()
+    parts = raw.split(":")
+    if len(parts) < 4:
+        await event.respond(
+            "❌ قالب اشتباه است. باید این‌طور باشد:\n`host:port:user:pass`",
+            buttons=[[Button.inline("🔙 بازگشت", b"proxies")]],
+        )
+        return
+    host = parts[0].strip()
+    try:
+        ssh_port = int(parts[1].strip())
+    except ValueError:
+        ssh_port = 22
+    ssh_user = parts[2].strip()
+    ssh_pass = ":".join(parts[3:]).strip()  # password may contain ':'
+
+    # default proxy settings (auto-generated credentials)
+    proxy_port = 1080
+    proxy_user = "rubika"
+    proxy_pass = "rubika" + str(abs(hash(host)) % 100000)
+
+    pid = db.add_proxy(host, ssh_port, ssh_user, ssh_pass, proxy_port, proxy_user, proxy_pass)
+    await event.respond(
+        f"✅ سرور `{host}` ثبت شد.\n🔧 در حال نصب Docker و پروکسی ... (چند دقیقه صبر کن)",
+    )
+    ok, msg = await asyncio.to_thread(pm.setup_proxy, pid)
+    if not ok:
+        await event.respond(f"❌ نصب ناموفق: {msg}",
+                            buttons=[[Button.inline("🔙 پروکسی‌ها", b"proxies")]])
+        return
+    # test right after install (the key upload test)
+    p = db.get_proxy(pid)
+    ping_ms, upload_ok, status = await asyncio.to_thread(pm.test_proxy, p)
+    db.update_proxy_health(pid, status, ping_ms, upload_ok)
+    await log(card("PROXY ADDED 🔌", [
+        f"🖥 {host}",
+        f"وضعیت: {proxy_status_emoji(db.get_proxy(pid))} {status} — {ping_ms}ms",
+        f"آپلود: {'✅' if upload_ok else '❌'}",
+        f"🕒 {now()}",
+    ]))
+    verdict = "✅ آماده و سالم" if upload_ok else "⚠️ نصب شد ولی آپلود روبیکا جواب نداد"
+    await event.respond(
+        f"{verdict}\n🖥 {host}\nوضعیت: {status} — {ping_ms}ms — آپلود {'✅' if upload_ok else '❌'}",
+        buttons=[[Button.inline("🔙 پروکسی‌ها", b"proxies")]],
+    )
 
 
 async def handle_phone(event):
@@ -517,7 +727,13 @@ async def do_send(account_id: int):
     sent_set = set()
     error_detail = ""
 
-    client = rb.open_client(acc["phone"])
+    # Pick a healthy proxy (round-robin) to route Rubika traffic through an
+    # Iranian server. If none configured/healthy, connect directly.
+    chosen_proxy = pm.next_healthy_proxy()
+    proxy_tpl = pm.proxy_tuple(chosen_proxy) if chosen_proxy else None
+    proxy_label = chosen_proxy["host"] if chosen_proxy else "بدون پروکسی (مستقیم)"
+
+    client = rb.open_client(acc["phone"], proxy_tuple=proxy_tpl)
     try:
         # connect_ready rebuilds the signing keys (fixes 'NoneType has no sign')
         await rb.connect_ready(client)
@@ -575,6 +791,7 @@ async def do_send(account_id: int):
         await log(card("BROADCAST STARTED 🚀", [
             f"👤 Account : {acc['name'] or '-'}",
             f"📱 Phone : {acc['phone']}",
+            f"🔌 Proxy : {proxy_label}",
             f"🕒 Started : {now()}",
             LINE,
             f"📇 Contacts : {n_contacts}  (💬 with chat: {n_with_chat})",
@@ -743,6 +960,7 @@ async def main():
     await bot.start(bot_token=config.BOT_TOKEN)
 
     asyncio.create_task(send_worker())
+    asyncio.create_task(health_check_loop())
 
     me = await bot.get_me()
     print(f"Rubika panel bot is running as @{me.username}. Press Ctrl+C to stop.")
