@@ -73,11 +73,20 @@ async def log(text: str):
 # --------------------------------------------------------------------------- #
 def main_menu():
     return [
-        [Button.inline("➕ افزودن اکانت", b"add_account")],
-        [Button.inline("👥 مدیریت اکانت‌ها", b"manage_accounts")],
-        [Button.inline("⚙️ تنظیم محتوای ارسالی", b"set_content")],
-        [Button.inline("💾 بکاپ گرفتن", b"backup")],
+        [Button.inline("➕ افزودن اکانت", b"add_account"),
+         Button.inline("👥 اکانت‌ها", b"manage_accounts")],
+        [Button.inline("⚙️ تنظیم محتوا", b"set_content")],
+        [Button.inline("💾 بکاپ", b"backup")],
     ]
+
+
+WELCOME = (
+    "╭───────────────────╮\n"
+    "     🤖  پنل روبیکا\n"
+    "╰───────────────────╯\n"
+    "به پنل مدیریت خوش اومدی 👋\n"
+    "یکی از گزینه‌های زیر را انتخاب کن:"
+)
 
 
 def content_summary(content: dict) -> str:
@@ -100,10 +109,7 @@ async def start_handler(event):
         await event.respond("⛔ شما به این ربات دسترسی ندارید.")
         return
     state.pop(event.sender_id, None)
-    await event.respond(
-        "👋 خوش آمدی به پنل مدیریت اکانت‌های روبیکا.\nیکی از گزینه‌ها را انتخاب کن:",
-        buttons=main_menu(),
-    )
+    await event.respond(WELCOME, buttons=main_menu())
 
 
 @bot.on(events.CallbackQuery(data=b"home"))
@@ -111,7 +117,7 @@ async def home_cb(event):
     if not is_owner(event):
         return
     state.pop(event.sender_id, None)
-    await event.edit("👋 منوی اصلی:", buttons=main_menu())
+    await event.edit(WELCOME, buttons=main_menu())
 
 
 @bot.on(events.CallbackQuery(data=b"cancel"))
@@ -177,11 +183,13 @@ async def account_menu_cb(event):
         return
     status = "فعال ✅" if acc["status"] == "active" else "غیرفعال ⚠️"
     text = (
-        f"👤 اکانت: {acc['name'] or '-'}\n"
-        f"📱 شماره: {acc['phone']}\n"
-        f"🆔 آیدی: {acc['user_id']}\n"
-        f"📅 افزوده‌شده: {acc['added_at']}\n"
-        f"وضعیت: {status}"
+        "╭───── 👤 اکانت ─────╮\n"
+        f"  نام    : {acc['name'] or '-'}\n"
+        f"  شماره  : {acc['phone']}\n"
+        f"  آیدی   : {acc['user_id']}\n"
+        f"  افزوده : {acc['added_at']}\n"
+        f"  وضعیت  : {status}\n"
+        "╰────────────────────╯"
     )
     buttons = [
         [Button.inline("🚀 شروع ارسال", f"send_{account_id}".encode())],
